@@ -7,12 +7,83 @@ const GRAY = 'gray';
 const YELLOW = 'yellow';
 const GREEN = 'green';
 
+// Helper: Given a guess and an answer, return the color pattern
+function getColorPattern(guess, answer) {
+  const pattern = ['gray', 'gray', 'gray', 'gray', 'gray'];
+  const answerLetters = answer.split('');
+  const guessLetters = guess.split('');
+  
+  // First pass: mark greens
+  for (let i = 0; i < 5; i++) {
+    if (guessLetters[i] === answerLetters[i]) {
+      pattern[i] = 'green';
+      answerLetters[i] = null; // Mark as used
+      guessLetters[i] = null;
+    }
+  }
+  
+  // Second pass: mark yellows
+  for (let i = 0; i < 5; i++) {
+    if (guessLetters[i] !== null) {
+      const idx = answerLetters.indexOf(guessLetters[i]);
+      if (idx !== -1) {
+        pattern[i] = 'yellow';
+        answerLetters[idx] = null; // Mark as used
+      }
+    }
+  }
+  
+  return pattern.join(',');
+}
+
+// Calculate best guesses based on expected remaining words
+function calculateBestGuesses(remainingWords, allWords) {
+  if (remainingWords.length <= 1) return [];
+  if (remainingWords.length > 150) return []; // Too many, skip calculation
+  
+  const guessScores = [];
+  
+  // Check each possible guess (use all words as potential guesses for better results)
+  const guessPool = remainingWords.length > 50 ? remainingWords : allWords;
+  
+  for (const guess of guessPool) {
+    // For each guess, count how many words end up in each "bucket" (color pattern)
+    const patternBuckets = {};
+    
+    for (const answer of remainingWords) {
+      const pattern = getColorPattern(guess, answer);
+      patternBuckets[pattern] = (patternBuckets[pattern] || 0) + 1;
+    }
+    
+    // Calculate expected remaining words (weighted average of bucket sizes)
+    const bucketSizes = Object.values(patternBuckets);
+    const expectedRemaining = bucketSizes.reduce((sum, size) => sum + (size * size), 0) / remainingWords.length;
+    
+    // Calculate elimination percentage
+    const eliminationPct = ((remainingWords.length - expectedRemaining) / remainingWords.length) * 100;
+    
+    guessScores.push({
+      word: guess,
+      expectedRemaining: expectedRemaining,
+      eliminationPct: eliminationPct,
+      isRemainingWord: remainingWords.includes(guess)
+    });
+  }
+  
+  // Sort by expected remaining (lower is better)
+  guessScores.sort((a, b) => a.expectedRemaining - b.expectedRemaining);
+  
+  // Return top 8
+  return guessScores.slice(0, 8);
+}
+
 export default function Home() {
   // Each guess is { word: string, colors: [color, color, color, color, color] }
   const [guesses, setGuesses] = useState([]);
   const [currentWord, setCurrentWord] = useState('');
   const [currentColors, setCurrentColors] = useState([GRAY, GRAY, GRAY, GRAY, GRAY]);
   const [error, setError] = useState('');
+  const [showSuggestions, setShowSuggestions] = useState(false);
 
   // Filter words based on all guesses
   const filteredWords = useMemo(() => {
@@ -58,6 +129,12 @@ export default function Home() {
     
     return words;
   }, [guesses]);
+
+  // Calculate best guesses (only when suggestions panel is open)
+  const bestGuesses = useMemo(() => {
+    if (!showSuggestions) return [];
+    return calculateBestGuesses(filteredWords, wordleWords);
+  }, [filteredWords, showSuggestions]);
 
   // Calculate letter frequencies by position
   const positionFrequencies = useMemo(() => {
@@ -112,6 +189,7 @@ export default function Home() {
     setCurrentWord('');
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
+    setShowSuggestions(false); // Collapse suggestions when new guess added
   };
 
   const removeGuess = (index) => {
@@ -123,6 +201,7 @@ export default function Home() {
     setCurrentWord('');
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
+    setShowSuggestions(false);
   };
 
   const getColorClass = (color) => {
@@ -241,6 +320,48 @@ export default function Home() {
             <p className="too-many">Showing letter frequencies below. Add more guesses to narrow down.</p>
           )}
         </div>
+
+        {/* Strategic Suggestions - Collapsible */}
+        {guesses.length > 0 && filteredWords.length > 1 && filteredWords.length <= 150 && (
+          <div className="suggestions-section">
+            <button 
+              className="suggestions-toggle"
+              onClick={() => setShowSuggestions(!showSuggestions)}
+            >
+              <span className="toggle-icon">{showSuggestions ? '▼' : '▶'}</span>
+              <span>🎯 Strategic Suggestions</span>
+              <span className="toggle-hint">{showSuggestions ? 'hide' : 'show best guesses'}</span>
+            </button>
+            
+            {showSuggestions && (
+              <div className="suggestions-content">
+                {bestGuesses.length === 0 ? (
+                  <p className="calculating">Calculating...</p>
+                ) : (
+                  <>
+                    <p className="suggestions-explainer">
+                      These words will eliminate the most possibilities on average:
+                    </p>
+                    <div className="suggestions-list">
+                      {bestGuesses.map((guess, idx) => (
+                        <div key={idx} className={`suggestion-item ${guess.isRemainingWord ? 'is-answer' : ''}`}>
+                          <span className="suggestion-rank">#{idx + 1}</span>
+                          <span className="suggestion-word">{guess.word.toUpperCase()}</span>
+                          <span className="suggestion-stat">
+                            eliminates ~{Math.round(guess.eliminationPct)}%
+                          </span>
+                          {guess.isRemainingWord && (
+                            <span className="suggestion-badge">could be answer</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Position Frequencies */}
         <div className="frequencies-section">
@@ -564,6 +685,112 @@ export default function Home() {
         .no-words, .too-many {
           color: #9ca3af;
           font-style: italic;
+        }
+
+        /* Strategic Suggestions Section */
+        .suggestions-section {
+          background: rgba(99, 102, 241, 0.1);
+          border: 1px solid rgba(99, 102, 241, 0.3);
+          border-radius: 16px;
+          margin-bottom: 2rem;
+          overflow: hidden;
+        }
+
+        .suggestions-toggle {
+          width: 100%;
+          padding: 1rem 1.5rem;
+          display: flex;
+          align-items: center;
+          gap: 0.75rem;
+          background: transparent;
+          border: none;
+          color: #e5e7eb;
+          font-family: 'Outfit', sans-serif;
+          font-size: 1rem;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.15s;
+        }
+
+        .suggestions-toggle:hover {
+          background: rgba(99, 102, 241, 0.1);
+        }
+
+        .toggle-icon {
+          font-size: 0.75rem;
+          color: #6366f1;
+        }
+
+        .toggle-hint {
+          margin-left: auto;
+          font-size: 0.85rem;
+          font-weight: 400;
+          color: #6b7280;
+        }
+
+        .suggestions-content {
+          padding: 0 1.5rem 1.5rem 1.5rem;
+        }
+
+        .suggestions-explainer {
+          font-size: 0.9rem;
+          color: #9ca3af;
+          margin-bottom: 1rem;
+        }
+
+        .calculating {
+          color: #6b7280;
+          font-style: italic;
+        }
+
+        .suggestions-list {
+          display: flex;
+          flex-direction: column;
+          gap: 0.5rem;
+        }
+
+        .suggestion-item {
+          display: flex;
+          align-items: center;
+          gap: 1rem;
+          padding: 0.75rem 1rem;
+          background: #111827;
+          border-radius: 8px;
+          border: 1px solid #1f2937;
+        }
+
+        .suggestion-item.is-answer {
+          border-color: rgba(34, 197, 94, 0.4);
+          background: rgba(34, 197, 94, 0.05);
+        }
+
+        .suggestion-rank {
+          font-family: 'Space Mono', monospace;
+          font-size: 0.85rem;
+          color: #6366f1;
+          font-weight: 700;
+        }
+
+        .suggestion-word {
+          font-family: 'Space Mono', monospace;
+          font-size: 1.1rem;
+          font-weight: 700;
+          letter-spacing: 0.15em;
+          color: #e5e7eb;
+        }
+
+        .suggestion-stat {
+          font-size: 0.85rem;
+          color: #9ca3af;
+        }
+
+        .suggestion-badge {
+          margin-left: auto;
+          font-size: 0.75rem;
+          color: #22c55e;
+          background: rgba(34, 197, 94, 0.15);
+          padding: 0.25rem 0.5rem;
+          border-radius: 4px;
         }
 
         /* Frequencies Section */
