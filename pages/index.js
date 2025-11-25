@@ -43,8 +43,8 @@ function calculateBestGuesses(remainingWords, allWords) {
   
   const guessScores = [];
   
-  // Check each possible guess (use all words as potential guesses for better results)
-  const guessPool = remainingWords.length > 50 ? remainingWords : allWords;
+  // Only suggest words that could actually be the answer
+  const guessPool = remainingWords;
   
   for (const guess of guessPool) {
     // For each guess, count how many words end up in each "bucket" (color pattern)
@@ -340,19 +340,16 @@ export default function Home() {
                 ) : (
                   <>
                     <p className="suggestions-explainer">
-                      These words will eliminate the most possibilities on average:
+                      Best guesses from remaining words (highest chance to win or eliminate):
                     </p>
                     <div className="suggestions-list">
                       {bestGuesses.map((guess, idx) => (
-                        <div key={idx} className={`suggestion-item ${guess.isRemainingWord ? 'is-answer' : ''}`}>
+                        <div key={idx} className="suggestion-item">
                           <span className="suggestion-rank">#{idx + 1}</span>
                           <span className="suggestion-word">{guess.word.toUpperCase()}</span>
                           <span className="suggestion-stat">
                             eliminates ~{Math.round(guess.eliminationPct)}%
                           </span>
-                          {guess.isRemainingWord && (
-                            <span className="suggestion-badge">could be answer</span>
-                          )}
                         </div>
                       ))}
                     </div>
