@@ -17,7 +17,7 @@ function getColorPattern(guess, answer) {
   for (let i = 0; i < 5; i++) {
     if (guessLetters[i] === answerLetters[i]) {
       pattern[i] = 'green';
-      answerLetters[i] = null; // Mark as used
+      answerLetters[i] = null;
       guessLetters[i] = null;
     }
   }
@@ -28,7 +28,7 @@ function getColorPattern(guess, answer) {
       const idx = answerLetters.indexOf(guessLetters[i]);
       if (idx !== -1) {
         pattern[i] = 'yellow';
-        answerLetters[idx] = null; // Mark as used
+        answerLetters[idx] = null;
       }
     }
   }
@@ -36,18 +36,14 @@ function getColorPattern(guess, answer) {
   return pattern.join(',');
 }
 
-// Calculate best guesses based on expected remaining words
-function calculateBestGuesses(remainingWords, allWords) {
+// Calculate best guesses from remaining words based on expected elimination
+function calculateBestGuesses(remainingWords) {
   if (remainingWords.length <= 1) return [];
-  if (remainingWords.length > 150) return []; // Too many, skip calculation
+  if (remainingWords.length > 150) return [];
   
   const guessScores = [];
   
-  // Only suggest words that could actually be the answer
-  const guessPool = remainingWords;
-  
-  for (const guess of guessPool) {
-    // For each guess, count how many words end up in each "bucket" (color pattern)
+  for (const guess of remainingWords) {
     const patternBuckets = {};
     
     for (const answer of remainingWords) {
@@ -55,35 +51,100 @@ function calculateBestGuesses(remainingWords, allWords) {
       patternBuckets[pattern] = (patternBuckets[pattern] || 0) + 1;
     }
     
-    // Calculate expected remaining words (weighted average of bucket sizes)
     const bucketSizes = Object.values(patternBuckets);
     const expectedRemaining = bucketSizes.reduce((sum, size) => sum + (size * size), 0) / remainingWords.length;
-    
-    // Calculate elimination percentage
     const eliminationPct = ((remainingWords.length - expectedRemaining) / remainingWords.length) * 100;
     
     guessScores.push({
       word: guess,
-      expectedRemaining: expectedRemaining,
-      eliminationPct: eliminationPct,
-      isRemainingWord: remainingWords.includes(guess)
+      expectedRemaining,
+      eliminationPct
     });
   }
   
-  // Sort by expected remaining (lower is better)
   guessScores.sort((a, b) => a.expectedRemaining - b.expectedRemaining);
-  
-  // Return top 8
   return guessScores.slice(0, 8);
 }
 
+// Calculate most common letters across remaining words (excluding already known letters)
+function calculateCommonLetters(remainingWords, knownLetters) {
+  const letterCounts = {};
+  
+  for (const word of remainingWords) {
+    // Count unique letters per word (so a word with 'ee' only counts 'e' once)
+    const uniqueLetters = [...new Set(word.split(''))];
+    for (const letter of uniqueLetters) {
+      if (!knownLetters.has(letter)) {
+        letterCounts[letter] = (letterCounts[letter] || 0) + 1;
+      }
+    }
+  }
+  
+  return Object.entries(letterCounts)
+    .map(([letter, count]) => ({
+      letter: letter.toUpperCase(),
+      count,
+      percentage: Math.round((count / remainingWords.length) * 100)
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
+// Find words from full dictionary that contain the most common untested letters
+function calculateInfoGatheringWords(remainingWords, allWords, knownLetters) {
+  if (remainingWords.length <= 2) return [];
+  
+  const commonLetters = calculateCommonLetters(remainingWords, knownLetters);
+  const topLetters = commonLetters.slice(0, 10).map(l => l.letter.toLowerCase());
+  
+  if (topLetters.length === 0) return [];
+  
+  const wordScores = [];
+  
+  for (const word of allWords) {
+    const uniqueLetters = [...new Set(word.split(''))];
+    const matchingLetters = uniqueLetters.filter(l => topLetters.includes(l));
+    const score = matchingLetters.length;
+    
+    // Bonus: prefer words that could also be answers
+    const couldBeAnswer = remainingWords.includes(word);
+    
+    if (score >= 3) {
+      wordScores.push({
+        word,
+        score,
+        matchingLetters: matchingLetters.map(l => l.toUpperCase()),
+        couldBeAnswer
+      });
+    }
+  }
+  
+  // Sort by score (descending), then by couldBeAnswer
+  wordScores.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return b.couldBeAnswer - a.couldBeAnswer;
+  });
+  
+  return wordScores.slice(0, 8);
+}
+
+// Extract all letters that have been tested from guesses
+function getKnownLetters(guesses) {
+  const known = new Set();
+  for (const guess of guesses) {
+    for (const letter of guess.word) {
+      known.add(letter);
+    }
+  }
+  return known;
+}
+
 export default function Home() {
-  // Each guess is { word: string, colors: [color, color, color, color, color] }
   const [guesses, setGuesses] = useState([]);
   const [currentWord, setCurrentWord] = useState('');
   const [currentColors, setCurrentColors] = useState([GRAY, GRAY, GRAY, GRAY, GRAY]);
   const [error, setError] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [showInfoMode, setShowInfoMode] = useState(false);
 
   // Filter words based on all guesses
   const filteredWords = useMemo(() => {
@@ -98,14 +159,11 @@ export default function Home() {
           const color = colors[i];
           
           if (color === GREEN) {
-            // Letter must be in this exact position
             if (candidate[i] !== letter) return false;
           } else if (color === YELLOW) {
-            // Letter must be in word but NOT in this position
             if (candidate[i] === letter) return false;
             if (!candidate.includes(letter)) return false;
           } else if (color === GRAY) {
-            // Letter is not in word (unless it's green/yellow elsewhere)
             const letterPositions = [];
             for (let j = 0; j < 5; j++) {
               if (word[j] === letter) letterPositions.push(j);
@@ -115,10 +173,8 @@ export default function Home() {
             );
             
             if (hasGreenOrYellow) {
-              // Letter appears elsewhere as green/yellow, so gray just means not in THIS position
               if (candidate[i] === letter) return false;
             } else {
-              // Letter is truly not in word
               if (candidate.includes(letter)) return false;
             }
           }
@@ -130,11 +186,25 @@ export default function Home() {
     return words;
   }, [guesses]);
 
-  // Calculate best guesses (only when suggestions panel is open)
+  // Get letters we've already tested
+  const knownLetters = useMemo(() => getKnownLetters(guesses), [guesses]);
+
+  // Calculate best guesses (only when panel is open)
   const bestGuesses = useMemo(() => {
     if (!showSuggestions) return [];
-    return calculateBestGuesses(filteredWords, wordleWords);
+    return calculateBestGuesses(filteredWords);
   }, [filteredWords, showSuggestions]);
+
+  // Calculate common letters and info gathering words
+  const commonLetters = useMemo(() => {
+    if (!showInfoMode) return [];
+    return calculateCommonLetters(filteredWords, knownLetters);
+  }, [filteredWords, knownLetters, showInfoMode]);
+
+  const infoGatheringWords = useMemo(() => {
+    if (!showInfoMode) return [];
+    return calculateInfoGatheringWords(filteredWords, wordleWords, knownLetters);
+  }, [filteredWords, knownLetters, showInfoMode]);
 
   // Calculate letter frequencies by position
   const positionFrequencies = useMemo(() => {
@@ -148,7 +218,6 @@ export default function Home() {
         letterCounts[letter] = (letterCounts[letter] || 0) + 1;
       }
       
-      // Convert to sorted array of { letter, count, percentage }
       const total = filteredWords.length;
       const sorted = Object.entries(letterCounts)
         .map(([letter, count]) => ({
@@ -157,7 +226,7 @@ export default function Home() {
           percentage: total > 0 ? Math.round((count / total) * 100) : 0
         }))
         .sort((a, b) => b.count - a.count)
-        .slice(0, 8); // Top 8 letters
+        .slice(0, 8);
       
       frequencies.push(sorted);
     }
@@ -189,7 +258,8 @@ export default function Home() {
     setCurrentWord('');
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
-    setShowSuggestions(false); // Collapse suggestions when new guess added
+    setShowSuggestions(false);
+    setShowInfoMode(false);
   };
 
   const removeGuess = (index) => {
@@ -202,6 +272,7 @@ export default function Home() {
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
     setShowSuggestions(false);
+    setShowInfoMode(false);
   };
 
   const getColorClass = (color) => {
@@ -275,7 +346,6 @@ export default function Home() {
                     {letter.toUpperCase()}
                   </button>
                 ))}
-                {/* Pad with empty tiles */}
                 {Array(5 - currentWord.length).fill(null).map((_, idx) => (
                   <div key={`empty-${idx}`} className="tile tile-empty"></div>
                 ))}
@@ -330,7 +400,7 @@ export default function Home() {
             >
               <span className="toggle-icon">{showSuggestions ? '▼' : '▶'}</span>
               <span>🎯 Strategic Suggestions</span>
-              <span className="toggle-hint">{showSuggestions ? 'hide' : 'show best guesses'}</span>
+              <span className="toggle-hint">{showSuggestions ? 'hide' : 'could be the answer'}</span>
             </button>
             
             {showSuggestions && (
@@ -354,6 +424,62 @@ export default function Home() {
                       ))}
                     </div>
                   </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Info Gathering Mode - Collapsible */}
+        {guesses.length > 0 && filteredWords.length > 2 && (
+          <div className="suggestions-section info-mode">
+            <button 
+              className="suggestions-toggle"
+              onClick={() => setShowInfoMode(!showInfoMode)}
+            >
+              <span className="toggle-icon">{showInfoMode ? '▼' : '▶'}</span>
+              <span>🔍 Info Gathering Mode</span>
+              <span className="toggle-hint">{showInfoMode ? 'hide' : 'test common letters'}</span>
+            </button>
+            
+            {showInfoMode && (
+              <div className="suggestions-content">
+                {/* Common untested letters */}
+                <div className="common-letters-section">
+                  <p className="suggestions-explainer">
+                    Most common untested letters in remaining words:
+                  </p>
+                  <div className="common-letters">
+                    {commonLetters.slice(0, 10).map((item, idx) => (
+                      <div key={idx} className="common-letter-item">
+                        <span className="common-letter">{item.letter}</span>
+                        <span className="common-letter-pct">{item.percentage}%</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Words that test these letters */}
+                {infoGatheringWords.length > 0 && (
+                  <div className="info-words-section">
+                    <p className="suggestions-explainer">
+                      Words that test the most common letters:
+                    </p>
+                    <div className="suggestions-list">
+                      {infoGatheringWords.map((item, idx) => (
+                        <div key={idx} className={`suggestion-item ${item.couldBeAnswer ? 'is-answer' : ''}`}>
+                          <span className="suggestion-rank">#{idx + 1}</span>
+                          <span className="suggestion-word">{item.word.toUpperCase()}</span>
+                          <span className="suggestion-stat">
+                            tests {item.matchingLetters.join(', ')}
+                          </span>
+                          {item.couldBeAnswer && (
+                            <span className="suggestion-badge">could be answer</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 )}
               </div>
             )}
@@ -689,8 +815,13 @@ export default function Home() {
           background: rgba(99, 102, 241, 0.1);
           border: 1px solid rgba(99, 102, 241, 0.3);
           border-radius: 16px;
-          margin-bottom: 2rem;
+          margin-bottom: 1rem;
           overflow: hidden;
+        }
+
+        .suggestions-section.info-mode {
+          background: rgba(245, 158, 11, 0.1);
+          border: 1px solid rgba(245, 158, 11, 0.3);
         }
 
         .suggestions-toggle {
@@ -713,9 +844,17 @@ export default function Home() {
           background: rgba(99, 102, 241, 0.1);
         }
 
+        .info-mode .suggestions-toggle:hover {
+          background: rgba(245, 158, 11, 0.1);
+        }
+
         .toggle-icon {
           font-size: 0.75rem;
           color: #6366f1;
+        }
+
+        .info-mode .toggle-icon {
+          color: #f59e0b;
         }
 
         .toggle-hint {
@@ -754,6 +893,7 @@ export default function Home() {
           background: #111827;
           border-radius: 8px;
           border: 1px solid #1f2937;
+          flex-wrap: wrap;
         }
 
         .suggestion-item.is-answer {
@@ -766,6 +906,10 @@ export default function Home() {
           font-size: 0.85rem;
           color: #6366f1;
           font-weight: 700;
+        }
+
+        .info-mode .suggestion-rank {
+          color: #f59e0b;
         }
 
         .suggestion-word {
@@ -788,6 +932,43 @@ export default function Home() {
           background: rgba(34, 197, 94, 0.15);
           padding: 0.25rem 0.5rem;
           border-radius: 4px;
+        }
+
+        /* Common Letters */
+        .common-letters-section {
+          margin-bottom: 1.5rem;
+        }
+
+        .common-letters {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.5rem;
+        }
+
+        .common-letter-item {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          padding: 0.5rem 0.75rem;
+          background: #111827;
+          border-radius: 8px;
+          border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+
+        .common-letter {
+          font-family: 'Space Mono', monospace;
+          font-size: 1.25rem;
+          font-weight: 700;
+          color: #f59e0b;
+        }
+
+        .common-letter-pct {
+          font-size: 0.7rem;
+          color: #6b7280;
+        }
+
+        .info-words-section {
+          margin-top: 1rem;
         }
 
         /* Frequencies Section */
@@ -814,6 +995,17 @@ export default function Home() {
         @media (max-width: 768px) {
           .freq-grid {
             grid-template-columns: repeat(2, 1fr);
+          }
+          
+          .suggestion-item {
+            gap: 0.5rem;
+          }
+          
+          .suggestion-badge {
+            margin-left: 0;
+            margin-top: 0.5rem;
+            width: 100%;
+            text-align: center;
           }
         }
 
