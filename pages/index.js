@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import Head from 'next/head';
-import { wordleWords } from '../data/words';
+import { wordleWords, extendedWords } from '../data/words';
 
 // Color states
 const GRAY = 'gray';
@@ -64,7 +64,6 @@ function getKnownLetters(guesses) {
 }
 
 // DETECT PATTERN TRAP
-// Returns { isTrapped, pattern, lockedPositions, variablePositions, variableLetters }
 function detectPatternTrap(remainingWords) {
   if (remainingWords.length < 2 || remainingWords.length > 20) {
     return { isTrapped: false };
@@ -86,7 +85,6 @@ function detectPatternTrap(remainingWords) {
     const uniqueLetters = Object.keys(lettersAtPos);
     const mostCommonCount = Math.max(...Object.values(lettersAtPos));
 
-    // Position is "locked" if 80%+ of words share the same letter
     if (mostCommonCount / n >= 0.8 && uniqueLetters.length <= 2) {
       const dominantLetter = Object.entries(lettersAtPos).find(([_, count]) => count === mostCommonCount)[0];
       lockedPositions.push(pos);
@@ -98,10 +96,8 @@ function detectPatternTrap(remainingWords) {
     }
   }
 
-  // It's a trap if we have at least 3 locked positions and at least 1 variable
   const isTrapped = lockedPositions.length >= 3 && variablePositions.length >= 1 && variablePositions.length <= 2;
 
-  // Collect all variable letters
   const variableLetters = new Set();
   for (const pos of variablePositions) {
     for (const letter of variableLettersByPosition[pos]) {
@@ -128,17 +124,13 @@ function findPatternBreakerWords(remainingWords, allWords, patternInfo, knownLet
   const probeScores = [];
 
   for (const word of allWords) {
-    // Skip if it's already a remaining word (those are handled separately)
     if (remainingWords.includes(word)) continue;
 
     const uniqueLetters = new Set(word.split(''));
     const testedVariableLetters = variableLetters.filter(vl => uniqueLetters.has(vl));
 
-    // Only consider words that test at least 2 variable letters (or all if there are fewer)
     const minToTest = Math.min(2, variableLetters.length);
     if (testedVariableLetters.length >= minToTest) {
-      // Calculate how many words would remain for each possible outcome
-      // Simplified: assume testing N variable letters narrows to roughly remaining/N words
       const narrowsTo = Math.ceil(remainingWords.length / (testedVariableLetters.length + 1));
 
       probeScores.push({
@@ -151,7 +143,6 @@ function findPatternBreakerWords(remainingWords, allWords, patternInfo, knownLet
     }
   }
 
-  // Sort by most letters tested, then alphabetically
   probeScores.sort((a, b) => {
     if (b.testedCount !== a.testedCount) return b.testedCount - a.testedCount;
     return a.word.localeCompare(b.word);
@@ -168,7 +159,6 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
 
   const turn = guessCount + 1;
 
-  // Phase-aware weights
   let wElim = 1.0;
   let wAnswer = 0.3;
   let wCoverage = 0.4;
@@ -188,7 +178,6 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
 
   const letterWeights = getLetterWeights(remainingWords);
 
-  // Build candidate pool
   let candidates;
   if (n > 40) {
     const scored = allWords.map(word => {
@@ -223,7 +212,6 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
     candidates = [...remainingWords];
   }
 
-  // Score each candidate
   const guessScoresRaw = [];
 
   for (const guess of candidates) {
@@ -292,7 +280,6 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
 
   guessScores.sort((a, b) => b.blendedScore - a.blendedScore);
 
-  // Get pattern breaker words if in a trap
   let patternBreakers = [];
   if (patternInfo.isTrapped) {
     patternBreakers = findPatternBreakerWords(remainingWords, allWords, patternInfo, knownLetters);
@@ -304,6 +291,46 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
   };
 }
 
+// Filter function that works on any word list
+function filterWordList(words, guesses) {
+  let filtered = [...words];
+  
+  for (const guess of guesses) {
+    const { word, colors } = guess;
+    
+    filtered = filtered.filter(candidate => {
+      for (let i = 0; i < 5; i++) {
+        const letter = word[i];
+        const color = colors[i];
+        
+        if (color === GREEN) {
+          if (candidate[i] !== letter) return false;
+        } else if (color === YELLOW) {
+          if (candidate[i] === letter) return false;
+          if (!candidate.includes(letter)) return false;
+        } else if (color === GRAY) {
+          const letterPositions = [];
+          for (let j = 0; j < 5; j++) {
+            if (word[j] === letter) letterPositions.push(j);
+          }
+          const hasGreenOrYellow = letterPositions.some(
+            pos => colors[pos] === GREEN || colors[pos] === YELLOW
+          );
+          
+          if (hasGreenOrYellow) {
+            if (candidate[i] === letter) return false;
+          } else {
+            if (candidate.includes(letter)) return false;
+          }
+        }
+      }
+      return true;
+    });
+  }
+  
+  return filtered;
+}
+
 export default function Home() {
   const [guesses, setGuesses] = useState([]);
   const [currentWord, setCurrentWord] = useState('');
@@ -311,57 +338,30 @@ export default function Home() {
   const [error, setError] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
 
-  // Filter words based on all guesses
-  const filteredWords = useMemo(() => {
-    let words = [...wordleWords];
-    
-    for (const guess of guesses) {
-      const { word, colors } = guess;
-      
-      words = words.filter(candidate => {
-        for (let i = 0; i < 5; i++) {
-          const letter = word[i];
-          const color = colors[i];
-          
-          if (color === GREEN) {
-            if (candidate[i] !== letter) return false;
-          } else if (color === YELLOW) {
-            if (candidate[i] === letter) return false;
-            if (!candidate.includes(letter)) return false;
-          } else if (color === GRAY) {
-            const letterPositions = [];
-            for (let j = 0; j < 5; j++) {
-              if (word[j] === letter) letterPositions.push(j);
-            }
-            const hasGreenOrYellow = letterPositions.some(
-              pos => colors[pos] === GREEN || colors[pos] === YELLOW
-            );
-            
-            if (hasGreenOrYellow) {
-              if (candidate[i] === letter) return false;
-            } else {
-              if (candidate.includes(letter)) return false;
-            }
-          }
-        }
-        return true;
-      });
-    }
-    
-    return words;
-  }, [guesses]);
+  // Filter primary word list
+  const filteredWords = useMemo(() => filterWordList(wordleWords, guesses), [guesses]);
+  
+  // Filter extended word list (fallback)
+  const filteredExtended = useMemo(() => {
+    if (filteredWords.length > 0 || extendedWords.length === 0) return [];
+    return filterWordList(extendedWords, guesses);
+  }, [guesses, filteredWords.length]);
+
+  // Use extended list if primary is empty
+  const usingExtended = filteredWords.length === 0 && filteredExtended.length > 0;
+  const displayWords = usingExtended ? filteredExtended : filteredWords;
 
   // Get letters we've already tested
   const knownLetters = useMemo(() => getKnownLetters(guesses), [guesses]);
 
   // Detect pattern trap
-  const patternInfo = useMemo(() => detectPatternTrap(filteredWords), [filteredWords]);
+  const patternInfo = useMemo(() => detectPatternTrap(displayWords), [displayWords]);
 
   // Calculate smart suggestions (blended algorithm)
   const { suggestions: smartSuggestions, patternBreakers } = useMemo(() => {
     if (!showSuggestions) return { suggestions: [], patternBreakers: [] };
-    return calculateSmartSuggestions(filteredWords, wordleWords, guesses.length, knownLetters, patternInfo);
-  }, [filteredWords, showSuggestions, guesses.length, knownLetters, patternInfo]);
+    return calculateSmartSuggestions(displayWords, wordleWords, guesses.length, knownLetters, patternInfo);
+  }, [displayWords, showSuggestions, guesses.length, knownLetters, patternInfo]);
 
   // Calculate letter frequencies by position
   const positionFrequencies = useMemo(() => {
@@ -370,12 +370,12 @@ export default function Home() {
     for (let pos = 0; pos < 5; pos++) {
       const letterCounts = {};
       
-      for (const word of filteredWords) {
+      for (const word of displayWords) {
         const letter = word[pos];
         letterCounts[letter] = (letterCounts[letter] || 0) + 1;
       }
       
-      const total = filteredWords.length;
+      const total = displayWords.length;
       const sorted = Object.entries(letterCounts)
         .map(([letter, count]) => ({
           letter: letter.toUpperCase(),
@@ -389,7 +389,7 @@ export default function Home() {
     }
     
     return frequencies;
-  }, [filteredWords]);
+  }, [displayWords]);
 
   // Determine game phase for display
   const gamePhase = useMemo(() => {
@@ -538,14 +538,24 @@ export default function Home() {
         <div className="results-section">
           <div className="results-header">
             <h2>Possible Words</h2>
-            <span className="word-count">{filteredWords.length} remaining</span>
+            <span className="word-count">{displayWords.length} remaining</span>
           </div>
 
-          {filteredWords.length === 0 ? (
-            <p className="no-words">No words match your criteria. Check your inputs!</p>
-          ) : filteredWords.length <= 50 ? (
+          {/* Extended list notice */}
+          {usingExtended && (
+            <div className="extended-notice">
+              ⚠️ No common words match — showing all valid Wordle words
+            </div>
+          )}
+
+          {displayWords.length === 0 ? (
+            <div className="no-words">
+              <p>No words match your criteria. Check your inputs!</p>
+              <p className="no-words-hint">The word might be a newer NYT addition not in our list yet.</p>
+            </div>
+          ) : displayWords.length <= 50 ? (
             <div className="word-grid">
-              {filteredWords.map((word, idx) => (
+              {displayWords.map((word, idx) => (
                 <div key={idx} className="word-item">{word}</div>
               ))}
             </div>
@@ -555,7 +565,7 @@ export default function Home() {
         </div>
 
         {/* Smart Suggestions */}
-        {guesses.length > 0 && filteredWords.length > 1 && filteredWords.length <= 300 && (
+        {guesses.length > 0 && displayWords.length > 1 && displayWords.length <= 300 && (
           <div className="suggestions-section">
             <button 
               className="suggestions-toggle"
@@ -588,7 +598,6 @@ export default function Home() {
                       </span>
                     </div>
                     
-                    {/* Pattern Breaker Words */}
                     {patternBreakers.length > 0 && (
                       <div className="pattern-breakers">
                         <p className="breakers-label">Test multiple letters at once:</p>
@@ -621,8 +630,8 @@ export default function Home() {
                           <span className="stat-elim">eliminates ~{guess.eliminationPct}%</span>
                           {guess.couldBeAnswer ? (
                             <span className="stat-answer">
-                              {filteredWords.length <= 10 
-                                ? `1 in ${filteredWords.length} chance`
+                              {displayWords.length <= 10 
+                                ? `1 in ${displayWords.length} chance`
                                 : `${guess.answerProbPct > 0 ? guess.answerProbPct : '<1'}% to win`
                               }
                             </span>
@@ -943,6 +952,16 @@ export default function Home() {
           border-radius: 99px;
         }
 
+        .extended-notice {
+          background: rgba(245, 158, 11, 0.15);
+          border: 1px solid rgba(245, 158, 11, 0.3);
+          border-radius: 8px;
+          padding: 0.75rem 1rem;
+          margin-bottom: 1rem;
+          font-size: 0.9rem;
+          color: #fbbf24;
+        }
+
         .word-grid {
           display: grid;
           grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
@@ -960,7 +979,21 @@ export default function Home() {
           text-align: center;
         }
 
-        .no-words, .too-many {
+        .no-words {
+          color: #9ca3af;
+        }
+
+        .no-words p {
+          margin-bottom: 0.5rem;
+        }
+
+        .no-words-hint {
+          font-size: 0.85rem;
+          font-style: italic;
+          color: #6b7280;
+        }
+
+        .too-many {
           color: #9ca3af;
           font-style: italic;
         }
@@ -1033,7 +1066,6 @@ export default function Home() {
           color: #9ca3af;
         }
 
-        /* Pattern Trap Alert */
         .pattern-alert {
           background: rgba(239, 68, 68, 0.1);
           border: 1px solid rgba(239, 68, 68, 0.3);
