@@ -13,7 +13,6 @@ function getColorPattern(guess, answer) {
   const answerLetters = answer.split('');
   const guessLetters = guess.split('');
   
-  // First pass: mark greens
   for (let i = 0; i < 5; i++) {
     if (guessLetters[i] === answerLetters[i]) {
       pattern[i] = 'green';
@@ -22,7 +21,6 @@ function getColorPattern(guess, answer) {
     }
   }
   
-  // Second pass: mark yellows
   for (let i = 0; i < 5; i++) {
     if (guessLetters[i] !== null) {
       const idx = answerLetters.indexOf(guessLetters[i]);
@@ -65,29 +63,123 @@ function getKnownLetters(guesses) {
   return known;
 }
 
-// THE BLENDED SMART SUGGESTIONS ALGORITHM
-function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLetters) {
-  const n = remainingWords.length;
-  if (n <= 1) return [];
-  if (n > 300) return []; // Too expensive to compute
+// DETECT PATTERN TRAP
+// Returns { isTrapped, pattern, lockedPositions, variablePositions, variableLetters }
+function detectPatternTrap(remainingWords) {
+  if (remainingWords.length < 2 || remainingWords.length > 20) {
+    return { isTrapped: false };
+  }
 
-  // Game phase: which round are we on?
+  const n = remainingWords.length;
+  const lockedPositions = [];
+  const variablePositions = [];
+  const variableLettersByPosition = {};
+  let patternString = '';
+
+  for (let pos = 0; pos < 5; pos++) {
+    const lettersAtPos = {};
+    for (const word of remainingWords) {
+      const letter = word[pos];
+      lettersAtPos[letter] = (lettersAtPos[letter] || 0) + 1;
+    }
+
+    const uniqueLetters = Object.keys(lettersAtPos);
+    const mostCommonCount = Math.max(...Object.values(lettersAtPos));
+
+    // Position is "locked" if 80%+ of words share the same letter
+    if (mostCommonCount / n >= 0.8 && uniqueLetters.length <= 2) {
+      const dominantLetter = Object.entries(lettersAtPos).find(([_, count]) => count === mostCommonCount)[0];
+      lockedPositions.push(pos);
+      patternString += dominantLetter.toUpperCase();
+    } else {
+      variablePositions.push(pos);
+      variableLettersByPosition[pos] = uniqueLetters;
+      patternString += '_';
+    }
+  }
+
+  // It's a trap if we have at least 3 locked positions and at least 1 variable
+  const isTrapped = lockedPositions.length >= 3 && variablePositions.length >= 1 && variablePositions.length <= 2;
+
+  // Collect all variable letters
+  const variableLetters = new Set();
+  for (const pos of variablePositions) {
+    for (const letter of variableLettersByPosition[pos]) {
+      variableLetters.add(letter);
+    }
+  }
+
+  return {
+    isTrapped,
+    pattern: patternString,
+    lockedPositions,
+    variablePositions,
+    variableLetters: [...variableLetters],
+    variableLettersByPosition
+  };
+}
+
+// Find probe words that test variable letters
+function findPatternBreakerWords(remainingWords, allWords, patternInfo, knownLetters) {
+  const { variableLetters } = patternInfo;
+  
+  if (variableLetters.length === 0) return [];
+
+  const probeScores = [];
+
+  for (const word of allWords) {
+    // Skip if it's already a remaining word (those are handled separately)
+    if (remainingWords.includes(word)) continue;
+
+    const uniqueLetters = new Set(word.split(''));
+    const testedVariableLetters = variableLetters.filter(vl => uniqueLetters.has(vl));
+
+    // Only consider words that test at least 2 variable letters (or all if there are fewer)
+    const minToTest = Math.min(2, variableLetters.length);
+    if (testedVariableLetters.length >= minToTest) {
+      // Calculate how many words would remain for each possible outcome
+      // Simplified: assume testing N variable letters narrows to roughly remaining/N words
+      const narrowsTo = Math.ceil(remainingWords.length / (testedVariableLetters.length + 1));
+
+      probeScores.push({
+        word,
+        testedLetters: testedVariableLetters.map(l => l.toUpperCase()),
+        testedCount: testedVariableLetters.length,
+        narrowsTo,
+        couldBeAnswer: false
+      });
+    }
+  }
+
+  // Sort by most letters tested, then alphabetically
+  probeScores.sort((a, b) => {
+    if (b.testedCount !== a.testedCount) return b.testedCount - a.testedCount;
+    return a.word.localeCompare(b.word);
+  });
+
+  return probeScores.slice(0, 5);
+}
+
+// THE BLENDED SMART SUGGESTIONS ALGORITHM
+function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLetters, patternInfo) {
+  const n = remainingWords.length;
+  if (n <= 1) return { suggestions: [], patternBreakers: [] };
+  if (n > 300) return { suggestions: [], patternBreakers: [] };
+
   const turn = guessCount + 1;
 
   // Phase-aware weights
-  let wElim = 1.0;      // Elimination power
-  let wAnswer = 0.3;    // Probability it's the answer
-  let wCoverage = 0.4;  // Tests common untested letters
-  let dupPenalty = 0.25; // Penalty for duplicate letters
+  let wElim = 1.0;
+  let wAnswer = 0.3;
+  let wCoverage = 0.4;
+  let dupPenalty = 0.25;
 
   if (turn >= 3 && turn <= 4) {
-    // Mid-game: balance everything
     wElim = 0.8;
     wAnswer = 0.7;
     wCoverage = 0.3;
     dupPenalty = 0.15;
   } else if (turn >= 5) {
-    // Late game: prioritize actually winning
     wElim = 0.4;
     wAnswer = 1.0;
     wCoverage = 0.15;
@@ -99,13 +191,10 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
   // Build candidate pool
   let candidates;
   if (n > 40) {
-    // When many words remain, consider "probe" words from full dictionary
-    // that have great letter coverage even if they can't be the answer
     const scored = allWords.map(word => {
       const uniqueLetters = new Set(word.split(''));
       let coverageScore = 0;
       for (const letter of uniqueLetters) {
-        // Only count letters we haven't tested yet
         if (!knownLetters.has(letter)) {
           coverageScore += letterWeights[letter] || 0;
         }
@@ -118,23 +207,19 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
     });
 
     scored.sort((a, b) => {
-      // Prefer high coverage, then prefer possible answers
       if (b.coverageScore !== a.coverageScore) return b.coverageScore - a.coverageScore;
       if (a.inRemaining !== b.inRemaining) return (b.inRemaining ? 1 : 0) - (a.inRemaining ? 1 : 0);
       return 0;
     });
 
-    // Take top candidates by coverage
     candidates = scored.slice(0, 120).map(s => s.word);
     
-    // Make sure all remaining words are also candidates
     for (const word of remainingWords) {
       if (!candidates.includes(word)) {
         candidates.push(word);
       }
     }
   } else {
-    // When narrowed down, just use remaining words
     candidates = [...remainingWords];
   }
 
@@ -153,11 +238,9 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
     const expectedRemaining = bucketSizes.reduce((sum, size) => sum + (size * size), 0) / n;
     const elimFraction = (n - expectedRemaining) / n;
 
-    // Is this word a possible answer?
     const inRemaining = remainingWords.includes(guess);
     const answerProb = inRemaining ? 1 / n : 0;
 
-    // Coverage score: how many high-frequency untested letters does it have?
     const uniqueLetters = [...new Set(guess.split(''))];
     let coverageScore = 0;
     for (const letter of uniqueLetters) {
@@ -166,7 +249,6 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
       }
     }
 
-    // Duplicate letter penalty (mostly for early game)
     const hasDuplicate = uniqueLetters.length < 5;
     const dupPenaltyApplied = hasDuplicate ? dupPenalty : 0;
 
@@ -182,14 +264,13 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
     });
   }
 
-  // Normalize scores for blending
   const minCov = Math.min(...guessScoresRaw.map(g => g.coverageScore));
   const maxCov = Math.max(...guessScoresRaw.map(g => g.coverageScore));
 
   const guessScores = guessScoresRaw.map(g => {
     const elimComponent = g.elimFraction;
     const coverageComponent = normalize(g.coverageScore, minCov, maxCov);
-    const answerComponent = g.answerProb * n; // Scale up so it matters
+    const answerComponent = g.answerProb * n;
 
     const blendedScore =
       wElim * elimComponent +
@@ -211,7 +292,16 @@ function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLe
 
   guessScores.sort((a, b) => b.blendedScore - a.blendedScore);
 
-  return guessScores.slice(0, 10);
+  // Get pattern breaker words if in a trap
+  let patternBreakers = [];
+  if (patternInfo.isTrapped) {
+    patternBreakers = findPatternBreakerWords(remainingWords, allWords, patternInfo, knownLetters);
+  }
+
+  return {
+    suggestions: guessScores.slice(0, 10),
+    patternBreakers
+  };
 }
 
 export default function Home() {
@@ -264,11 +354,14 @@ export default function Home() {
   // Get letters we've already tested
   const knownLetters = useMemo(() => getKnownLetters(guesses), [guesses]);
 
+  // Detect pattern trap
+  const patternInfo = useMemo(() => detectPatternTrap(filteredWords), [filteredWords]);
+
   // Calculate smart suggestions (blended algorithm)
-  const smartSuggestions = useMemo(() => {
-    if (!showSuggestions) return [];
-    return calculateSmartSuggestions(filteredWords, wordleWords, guesses.length, knownLetters);
-  }, [filteredWords, showSuggestions, guesses.length, knownLetters]);
+  const { suggestions: smartSuggestions, patternBreakers } = useMemo(() => {
+    if (!showSuggestions) return { suggestions: [], patternBreakers: [] };
+    return calculateSmartSuggestions(filteredWords, wordleWords, guesses.length, knownLetters, patternInfo);
+  }, [filteredWords, showSuggestions, guesses.length, knownLetters, patternInfo]);
 
   // Calculate letter frequencies by position
   const positionFrequencies = useMemo(() => {
@@ -461,7 +554,7 @@ export default function Home() {
           )}
         </div>
 
-        {/* Smart Suggestions - The Blended Algorithm */}
+        {/* Smart Suggestions */}
         {guesses.length > 0 && filteredWords.length > 1 && filteredWords.length <= 300 && (
           <div className="suggestions-section">
             <button 
@@ -481,6 +574,41 @@ export default function Home() {
                   <span className="phase-desc">{gamePhase.desc}</span>
                 </div>
 
+                {/* Pattern Trap Alert */}
+                {patternInfo.isTrapped && (
+                  <div className="pattern-alert">
+                    <div className="pattern-header">
+                      <span className="pattern-icon">⚠️</span>
+                      <span className="pattern-title">Pattern trap detected</span>
+                    </div>
+                    <div className="pattern-details">
+                      <span className="pattern-string">{patternInfo.pattern}</span>
+                      <span className="pattern-varying">
+                        varying: {patternInfo.variableLetters.map(l => l.toUpperCase()).join(', ')}
+                      </span>
+                    </div>
+                    
+                    {/* Pattern Breaker Words */}
+                    {patternBreakers.length > 0 && (
+                      <div className="pattern-breakers">
+                        <p className="breakers-label">Test multiple letters at once:</p>
+                        {patternBreakers.map((breaker, idx) => (
+                          <div key={idx} className="breaker-item">
+                            <span className="breaker-word">{breaker.word.toUpperCase()}</span>
+                            <span className="breaker-tests">
+                              tests {breaker.testedLetters.join(', ')}
+                            </span>
+                            <span className="breaker-narrows">
+                              → narrows to ~{breaker.narrowsTo}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Regular Suggestions */}
                 {smartSuggestions.length === 0 ? (
                   <p className="calculating">Calculating...</p>
                 ) : (
@@ -492,7 +620,12 @@ export default function Home() {
                         <div className="suggestion-stats">
                           <span className="stat-elim">eliminates ~{guess.eliminationPct}%</span>
                           {guess.couldBeAnswer ? (
-                            <span className="stat-answer">{guess.answerProbPct > 0 ? `${guess.answerProbPct}%` : '<1%'} chance to win</span>
+                            <span className="stat-answer">
+                              {filteredWords.length <= 10 
+                                ? `1 in ${filteredWords.length} chance`
+                                : `${guess.answerProbPct > 0 ? guess.answerProbPct : '<1'}% to win`
+                              }
+                            </span>
                           ) : (
                             <span className="stat-probe">probe word</span>
                           )}
@@ -600,7 +733,6 @@ export default function Home() {
           margin-bottom: 1rem;
         }
 
-        /* Tiles */
         .tile {
           width: 52px;
           height: 52px;
@@ -646,7 +778,6 @@ export default function Home() {
           transform: scale(1.05);
         }
 
-        /* Guesses Section */
         .guesses-section {
           margin-bottom: 2rem;
         }
@@ -685,7 +816,6 @@ export default function Home() {
           opacity: 1;
         }
 
-        /* Input Section */
         .input-section {
           background: rgba(31, 41, 55, 0.5);
           border: 1px solid #374151;
@@ -785,7 +915,6 @@ export default function Home() {
           background: #4b5563;
         }
 
-        /* Results Section */
         .results-section {
           background: rgba(31, 41, 55, 0.5);
           border: 1px solid #374151;
@@ -836,7 +965,6 @@ export default function Home() {
           font-style: italic;
         }
 
-        /* Smart Suggestions Section */
         .suggestions-section {
           background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
           border: 1px solid rgba(99, 102, 241, 0.3);
@@ -881,7 +1009,6 @@ export default function Home() {
           padding: 0 1.5rem 1.5rem 1.5rem;
         }
 
-        /* Phase Indicator */
         .phase-indicator {
           display: flex;
           align-items: center;
@@ -904,6 +1031,95 @@ export default function Home() {
         .phase-desc {
           font-size: 0.85rem;
           color: #9ca3af;
+        }
+
+        /* Pattern Trap Alert */
+        .pattern-alert {
+          background: rgba(239, 68, 68, 0.1);
+          border: 1px solid rgba(239, 68, 68, 0.3);
+          border-radius: 12px;
+          padding: 1rem;
+          margin-bottom: 1rem;
+        }
+
+        .pattern-header {
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+          margin-bottom: 0.5rem;
+        }
+
+        .pattern-icon {
+          font-size: 1.1rem;
+        }
+
+        .pattern-title {
+          font-weight: 600;
+          color: #fca5a5;
+        }
+
+        .pattern-details {
+          display: flex;
+          align-items: center;
+          gap: 1rem;
+          margin-bottom: 1rem;
+        }
+
+        .pattern-string {
+          font-family: 'Space Mono', monospace;
+          font-size: 1.5rem;
+          font-weight: 700;
+          letter-spacing: 0.2em;
+          color: #ef4444;
+        }
+
+        .pattern-varying {
+          font-size: 0.85rem;
+          color: #9ca3af;
+        }
+
+        .pattern-breakers {
+          background: rgba(0, 0, 0, 0.2);
+          border-radius: 8px;
+          padding: 0.75rem;
+        }
+
+        .breakers-label {
+          font-size: 0.8rem;
+          color: #9ca3af;
+          margin-bottom: 0.5rem;
+        }
+
+        .breaker-item {
+          display: flex;
+          align-items: center;
+          gap: 0.75rem;
+          padding: 0.5rem 0;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .breaker-item:last-child {
+          border-bottom: none;
+        }
+
+        .breaker-word {
+          font-family: 'Space Mono', monospace;
+          font-weight: 700;
+          font-size: 1rem;
+          letter-spacing: 0.1em;
+          color: #fbbf24;
+          min-width: 70px;
+        }
+
+        .breaker-tests {
+          font-size: 0.85rem;
+          color: #d1d5db;
+        }
+
+        .breaker-narrows {
+          font-size: 0.8rem;
+          color: #22c55e;
+          margin-left: auto;
         }
 
         .calculating {
@@ -996,7 +1212,6 @@ export default function Home() {
           color: #f59e0b;
         }
 
-        /* Frequencies Section */
         .frequencies-section {
           background: rgba(31, 41, 55, 0.5);
           border: 1px solid #374151;
@@ -1033,6 +1248,22 @@ export default function Home() {
           
           .badge {
             order: 4;
+          }
+
+          .pattern-details {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.25rem;
+          }
+
+          .breaker-item {
+            flex-wrap: wrap;
+          }
+
+          .breaker-narrows {
+            width: 100%;
+            margin-left: 0;
+            margin-top: 0.25rem;
           }
         }
 
