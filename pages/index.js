@@ -36,95 +36,22 @@ function getColorPattern(guess, answer) {
   return pattern.join(',');
 }
 
-// Calculate best guesses from remaining words based on expected elimination
-function calculateBestGuesses(remainingWords) {
-  if (remainingWords.length <= 1) return [];
-  if (remainingWords.length > 150) return [];
-  
-  const guessScores = [];
-  
-  for (const guess of remainingWords) {
-    const patternBuckets = {};
-    
-    for (const answer of remainingWords) {
-      const pattern = getColorPattern(guess, answer);
-      patternBuckets[pattern] = (patternBuckets[pattern] || 0) + 1;
-    }
-    
-    const bucketSizes = Object.values(patternBuckets);
-    const expectedRemaining = bucketSizes.reduce((sum, size) => sum + (size * size), 0) / remainingWords.length;
-    const eliminationPct = ((remainingWords.length - expectedRemaining) / remainingWords.length) * 100;
-    
-    guessScores.push({
-      word: guess,
-      expectedRemaining,
-      eliminationPct
-    });
-  }
-  
-  guessScores.sort((a, b) => a.expectedRemaining - b.expectedRemaining);
-  return guessScores.slice(0, 8);
+// Normalize a value between 0 and 1
+function normalize(value, min, max) {
+  if (max === min) return 0.5;
+  return (value - min) / (max - min);
 }
 
-// Calculate most common letters across remaining words (excluding already known letters)
-function calculateCommonLetters(remainingWords, knownLetters) {
-  const letterCounts = {};
-  
+// Get letter frequency weights from remaining words
+function getLetterWeights(remainingWords) {
+  const counts = {};
   for (const word of remainingWords) {
-    // Count unique letters per word (so a word with 'ee' only counts 'e' once)
-    const uniqueLetters = [...new Set(word.split(''))];
+    const uniqueLetters = new Set(word.split(''));
     for (const letter of uniqueLetters) {
-      if (!knownLetters.has(letter)) {
-        letterCounts[letter] = (letterCounts[letter] || 0) + 1;
-      }
+      counts[letter] = (counts[letter] || 0) + 1;
     }
   }
-  
-  return Object.entries(letterCounts)
-    .map(([letter, count]) => ({
-      letter: letter.toUpperCase(),
-      count,
-      percentage: Math.round((count / remainingWords.length) * 100)
-    }))
-    .sort((a, b) => b.count - a.count);
-}
-
-// Find words from full dictionary that contain the most common untested letters
-function calculateInfoGatheringWords(remainingWords, allWords, knownLetters) {
-  if (remainingWords.length <= 2) return [];
-  
-  const commonLetters = calculateCommonLetters(remainingWords, knownLetters);
-  const topLetters = commonLetters.slice(0, 10).map(l => l.letter.toLowerCase());
-  
-  if (topLetters.length === 0) return [];
-  
-  const wordScores = [];
-  
-  for (const word of allWords) {
-    const uniqueLetters = [...new Set(word.split(''))];
-    const matchingLetters = uniqueLetters.filter(l => topLetters.includes(l));
-    const score = matchingLetters.length;
-    
-    // Bonus: prefer words that could also be answers
-    const couldBeAnswer = remainingWords.includes(word);
-    
-    if (score >= 3) {
-      wordScores.push({
-        word,
-        score,
-        matchingLetters: matchingLetters.map(l => l.toUpperCase()),
-        couldBeAnswer
-      });
-    }
-  }
-  
-  // Sort by score (descending), then by couldBeAnswer
-  wordScores.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return b.couldBeAnswer - a.couldBeAnswer;
-  });
-  
-  return wordScores.slice(0, 8);
+  return counts;
 }
 
 // Extract all letters that have been tested from guesses
@@ -138,13 +65,161 @@ function getKnownLetters(guesses) {
   return known;
 }
 
+// THE BLENDED SMART SUGGESTIONS ALGORITHM
+function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLetters) {
+  const n = remainingWords.length;
+  if (n <= 1) return [];
+  if (n > 300) return []; // Too expensive to compute
+
+  // Game phase: which round are we on?
+  const turn = guessCount + 1;
+
+  // Phase-aware weights
+  let wElim = 1.0;      // Elimination power
+  let wAnswer = 0.3;    // Probability it's the answer
+  let wCoverage = 0.4;  // Tests common untested letters
+  let dupPenalty = 0.25; // Penalty for duplicate letters
+
+  if (turn >= 3 && turn <= 4) {
+    // Mid-game: balance everything
+    wElim = 0.8;
+    wAnswer = 0.7;
+    wCoverage = 0.3;
+    dupPenalty = 0.15;
+  } else if (turn >= 5) {
+    // Late game: prioritize actually winning
+    wElim = 0.4;
+    wAnswer = 1.0;
+    wCoverage = 0.15;
+    dupPenalty = 0.05;
+  }
+
+  const letterWeights = getLetterWeights(remainingWords);
+
+  // Build candidate pool
+  let candidates;
+  if (n > 40) {
+    // When many words remain, consider "probe" words from full dictionary
+    // that have great letter coverage even if they can't be the answer
+    const scored = allWords.map(word => {
+      const uniqueLetters = new Set(word.split(''));
+      let coverageScore = 0;
+      for (const letter of uniqueLetters) {
+        // Only count letters we haven't tested yet
+        if (!knownLetters.has(letter)) {
+          coverageScore += letterWeights[letter] || 0;
+        }
+      }
+      return { 
+        word, 
+        coverageScore, 
+        inRemaining: remainingWords.includes(word) 
+      };
+    });
+
+    scored.sort((a, b) => {
+      // Prefer high coverage, then prefer possible answers
+      if (b.coverageScore !== a.coverageScore) return b.coverageScore - a.coverageScore;
+      if (a.inRemaining !== b.inRemaining) return (b.inRemaining ? 1 : 0) - (a.inRemaining ? 1 : 0);
+      return 0;
+    });
+
+    // Take top candidates by coverage
+    candidates = scored.slice(0, 120).map(s => s.word);
+    
+    // Make sure all remaining words are also candidates
+    for (const word of remainingWords) {
+      if (!candidates.includes(word)) {
+        candidates.push(word);
+      }
+    }
+  } else {
+    // When narrowed down, just use remaining words
+    candidates = [...remainingWords];
+  }
+
+  // Score each candidate
+  const guessScoresRaw = [];
+
+  for (const guess of candidates) {
+    const patternBuckets = {};
+
+    for (const answer of remainingWords) {
+      const pattern = getColorPattern(guess, answer);
+      patternBuckets[pattern] = (patternBuckets[pattern] || 0) + 1;
+    }
+
+    const bucketSizes = Object.values(patternBuckets);
+    const expectedRemaining = bucketSizes.reduce((sum, size) => sum + (size * size), 0) / n;
+    const elimFraction = (n - expectedRemaining) / n;
+
+    // Is this word a possible answer?
+    const inRemaining = remainingWords.includes(guess);
+    const answerProb = inRemaining ? 1 / n : 0;
+
+    // Coverage score: how many high-frequency untested letters does it have?
+    const uniqueLetters = [...new Set(guess.split(''))];
+    let coverageScore = 0;
+    for (const letter of uniqueLetters) {
+      if (!knownLetters.has(letter)) {
+        coverageScore += letterWeights[letter] || 0;
+      }
+    }
+
+    // Duplicate letter penalty (mostly for early game)
+    const hasDuplicate = uniqueLetters.length < 5;
+    const dupPenaltyApplied = hasDuplicate ? dupPenalty : 0;
+
+    guessScoresRaw.push({
+      word: guess,
+      expectedRemaining,
+      elimFraction,
+      answerProb,
+      coverageScore,
+      inRemaining,
+      hasDuplicate,
+      dupPenaltyApplied
+    });
+  }
+
+  // Normalize scores for blending
+  const minCov = Math.min(...guessScoresRaw.map(g => g.coverageScore));
+  const maxCov = Math.max(...guessScoresRaw.map(g => g.coverageScore));
+
+  const guessScores = guessScoresRaw.map(g => {
+    const elimComponent = g.elimFraction;
+    const coverageComponent = normalize(g.coverageScore, minCov, maxCov);
+    const answerComponent = g.answerProb * n; // Scale up so it matters
+
+    const blendedScore =
+      wElim * elimComponent +
+      wCoverage * coverageComponent +
+      wAnswer * answerComponent -
+      g.dupPenaltyApplied;
+
+    return {
+      word: g.word,
+      blendedScore,
+      expectedRemaining: g.expectedRemaining,
+      eliminationPct: Math.round(g.elimFraction * 100),
+      answerProbPct: Math.round(g.answerProb * 100),
+      coverageScore: g.coverageScore,
+      couldBeAnswer: g.inRemaining,
+      hasDuplicate: g.hasDuplicate
+    };
+  });
+
+  guessScores.sort((a, b) => b.blendedScore - a.blendedScore);
+
+  return guessScores.slice(0, 10);
+}
+
 export default function Home() {
   const [guesses, setGuesses] = useState([]);
   const [currentWord, setCurrentWord] = useState('');
   const [currentColors, setCurrentColors] = useState([GRAY, GRAY, GRAY, GRAY, GRAY]);
   const [error, setError] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
-  const [showInfoMode, setShowInfoMode] = useState(false);
 
   // Filter words based on all guesses
   const filteredWords = useMemo(() => {
@@ -189,22 +264,11 @@ export default function Home() {
   // Get letters we've already tested
   const knownLetters = useMemo(() => getKnownLetters(guesses), [guesses]);
 
-  // Calculate best guesses (only when panel is open)
-  const bestGuesses = useMemo(() => {
+  // Calculate smart suggestions (blended algorithm)
+  const smartSuggestions = useMemo(() => {
     if (!showSuggestions) return [];
-    return calculateBestGuesses(filteredWords);
-  }, [filteredWords, showSuggestions]);
-
-  // Calculate common letters and info gathering words
-  const commonLetters = useMemo(() => {
-    if (!showInfoMode) return [];
-    return calculateCommonLetters(filteredWords, knownLetters);
-  }, [filteredWords, knownLetters, showInfoMode]);
-
-  const infoGatheringWords = useMemo(() => {
-    if (!showInfoMode) return [];
-    return calculateInfoGatheringWords(filteredWords, wordleWords, knownLetters);
-  }, [filteredWords, knownLetters, showInfoMode]);
+    return calculateSmartSuggestions(filteredWords, wordleWords, guesses.length, knownLetters);
+  }, [filteredWords, showSuggestions, guesses.length, knownLetters]);
 
   // Calculate letter frequencies by position
   const positionFrequencies = useMemo(() => {
@@ -234,6 +298,14 @@ export default function Home() {
     return frequencies;
   }, [filteredWords]);
 
+  // Determine game phase for display
+  const gamePhase = useMemo(() => {
+    const turn = guesses.length + 1;
+    if (turn <= 2) return { name: 'Early Game', desc: 'Prioritizing information gathering', color: '#f59e0b' };
+    if (turn <= 4) return { name: 'Mid Game', desc: 'Balancing info and solving', color: '#8b5cf6' };
+    return { name: 'Late Game', desc: 'Prioritizing the win', color: '#22c55e' };
+  }, [guesses.length]);
+
   const handleWordChange = (e) => {
     const val = e.target.value.toLowerCase().replace(/[^a-z]/g, '').slice(0, 5);
     setCurrentWord(val);
@@ -259,7 +331,6 @@ export default function Home() {
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
     setShowSuggestions(false);
-    setShowInfoMode(false);
   };
 
   const removeGuess = (index) => {
@@ -272,7 +343,6 @@ export default function Home() {
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
     setShowSuggestions(false);
-    setShowInfoMode(false);
   };
 
   const getColorClass = (color) => {
@@ -391,94 +461,50 @@ export default function Home() {
           )}
         </div>
 
-        {/* Strategic Suggestions - Collapsible */}
-        {guesses.length > 0 && filteredWords.length > 1 && filteredWords.length <= 150 && (
+        {/* Smart Suggestions - The Blended Algorithm */}
+        {guesses.length > 0 && filteredWords.length > 1 && filteredWords.length <= 300 && (
           <div className="suggestions-section">
             <button 
               className="suggestions-toggle"
               onClick={() => setShowSuggestions(!showSuggestions)}
             >
               <span className="toggle-icon">{showSuggestions ? '▼' : '▶'}</span>
-              <span>🎯 Strategic Suggestions</span>
-              <span className="toggle-hint">{showSuggestions ? 'hide' : 'could be the answer'}</span>
+              <span>🧠 Smart Suggestions</span>
+              <span className="toggle-hint">{showSuggestions ? 'hide' : 'show optimal plays'}</span>
             </button>
             
             {showSuggestions && (
               <div className="suggestions-content">
-                {bestGuesses.length === 0 ? (
-                  <p className="calculating">Calculating...</p>
-                ) : (
-                  <>
-                    <p className="suggestions-explainer">
-                      Best guesses from remaining words (highest chance to win or eliminate):
-                    </p>
-                    <div className="suggestions-list">
-                      {bestGuesses.map((guess, idx) => (
-                        <div key={idx} className="suggestion-item">
-                          <span className="suggestion-rank">#{idx + 1}</span>
-                          <span className="suggestion-word">{guess.word.toUpperCase()}</span>
-                          <span className="suggestion-stat">
-                            eliminates ~{Math.round(guess.eliminationPct)}%
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Info Gathering Mode - Collapsible */}
-        {guesses.length > 0 && filteredWords.length > 2 && (
-          <div className="suggestions-section info-mode">
-            <button 
-              className="suggestions-toggle"
-              onClick={() => setShowInfoMode(!showInfoMode)}
-            >
-              <span className="toggle-icon">{showInfoMode ? '▼' : '▶'}</span>
-              <span>🔍 Info Gathering Mode</span>
-              <span className="toggle-hint">{showInfoMode ? 'hide' : 'test common letters'}</span>
-            </button>
-            
-            {showInfoMode && (
-              <div className="suggestions-content">
-                {/* Common untested letters */}
-                <div className="common-letters-section">
-                  <p className="suggestions-explainer">
-                    Most common untested letters in remaining words:
-                  </p>
-                  <div className="common-letters">
-                    {commonLetters.slice(0, 10).map((item, idx) => (
-                      <div key={idx} className="common-letter-item">
-                        <span className="common-letter">{item.letter}</span>
-                        <span className="common-letter-pct">{item.percentage}%</span>
-                      </div>
-                    ))}
-                  </div>
+                {/* Game Phase Indicator */}
+                <div className="phase-indicator" style={{ borderColor: gamePhase.color }}>
+                  <span className="phase-name" style={{ color: gamePhase.color }}>{gamePhase.name}</span>
+                  <span className="phase-desc">{gamePhase.desc}</span>
                 </div>
 
-                {/* Words that test these letters */}
-                {infoGatheringWords.length > 0 && (
-                  <div className="info-words-section">
-                    <p className="suggestions-explainer">
-                      Words that test the most common letters:
-                    </p>
-                    <div className="suggestions-list">
-                      {infoGatheringWords.map((item, idx) => (
-                        <div key={idx} className={`suggestion-item ${item.couldBeAnswer ? 'is-answer' : ''}`}>
-                          <span className="suggestion-rank">#{idx + 1}</span>
-                          <span className="suggestion-word">{item.word.toUpperCase()}</span>
-                          <span className="suggestion-stat">
-                            tests {item.matchingLetters.join(', ')}
-                          </span>
-                          {item.couldBeAnswer && (
-                            <span className="suggestion-badge">could be answer</span>
+                {smartSuggestions.length === 0 ? (
+                  <p className="calculating">Calculating...</p>
+                ) : (
+                  <div className="suggestions-list">
+                    {smartSuggestions.map((guess, idx) => (
+                      <div key={idx} className={`suggestion-item ${guess.couldBeAnswer ? 'is-answer' : 'is-probe'}`}>
+                        <span className="suggestion-rank">#{idx + 1}</span>
+                        <span className="suggestion-word">{guess.word.toUpperCase()}</span>
+                        <div className="suggestion-stats">
+                          <span className="stat-elim">eliminates ~{guess.eliminationPct}%</span>
+                          {guess.couldBeAnswer ? (
+                            <span className="stat-answer">{guess.answerProbPct > 0 ? `${guess.answerProbPct}%` : '<1%'} chance to win</span>
+                          ) : (
+                            <span className="stat-probe">probe word</span>
                           )}
                         </div>
-                      ))}
-                    </div>
+                        {guess.couldBeAnswer && (
+                          <span className="badge badge-answer">✓ could be answer</span>
+                        )}
+                        {!guess.couldBeAnswer && (
+                          <span className="badge badge-probe">info only</span>
+                        )}
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -810,18 +836,13 @@ export default function Home() {
           font-style: italic;
         }
 
-        /* Strategic Suggestions Section */
+        /* Smart Suggestions Section */
         .suggestions-section {
-          background: rgba(99, 102, 241, 0.1);
+          background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
           border: 1px solid rgba(99, 102, 241, 0.3);
           border-radius: 16px;
-          margin-bottom: 1rem;
+          margin-bottom: 2rem;
           overflow: hidden;
-        }
-
-        .suggestions-section.info-mode {
-          background: rgba(245, 158, 11, 0.1);
-          border: 1px solid rgba(245, 158, 11, 0.3);
         }
 
         .suggestions-toggle {
@@ -841,20 +862,12 @@ export default function Home() {
         }
 
         .suggestions-toggle:hover {
-          background: rgba(99, 102, 241, 0.1);
-        }
-
-        .info-mode .suggestions-toggle:hover {
-          background: rgba(245, 158, 11, 0.1);
+          background: rgba(99, 102, 241, 0.15);
         }
 
         .toggle-icon {
           font-size: 0.75rem;
-          color: #6366f1;
-        }
-
-        .info-mode .toggle-icon {
-          color: #f59e0b;
+          color: #8b5cf6;
         }
 
         .toggle-hint {
@@ -868,10 +881,29 @@ export default function Home() {
           padding: 0 1.5rem 1.5rem 1.5rem;
         }
 
-        .suggestions-explainer {
-          font-size: 0.9rem;
-          color: #9ca3af;
+        /* Phase Indicator */
+        .phase-indicator {
+          display: flex;
+          align-items: center;
+          gap: 1rem;
+          padding: 0.75rem 1rem;
+          background: rgba(0, 0, 0, 0.3);
+          border-radius: 8px;
+          border-left: 3px solid;
           margin-bottom: 1rem;
+        }
+
+        .phase-name {
+          font-family: 'Space Mono', monospace;
+          font-weight: 700;
+          font-size: 0.85rem;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+        }
+
+        .phase-desc {
+          font-size: 0.85rem;
+          color: #9ca3af;
         }
 
         .calculating {
@@ -898,18 +930,20 @@ export default function Home() {
 
         .suggestion-item.is-answer {
           border-color: rgba(34, 197, 94, 0.4);
-          background: rgba(34, 197, 94, 0.05);
+          background: linear-gradient(135deg, rgba(34, 197, 94, 0.08) 0%, rgba(17, 24, 39, 1) 100%);
+        }
+
+        .suggestion-item.is-probe {
+          border-color: rgba(245, 158, 11, 0.4);
+          background: linear-gradient(135deg, rgba(245, 158, 11, 0.08) 0%, rgba(17, 24, 39, 1) 100%);
         }
 
         .suggestion-rank {
           font-family: 'Space Mono', monospace;
           font-size: 0.85rem;
-          color: #6366f1;
+          color: #8b5cf6;
           font-weight: 700;
-        }
-
-        .info-mode .suggestion-rank {
-          color: #f59e0b;
+          min-width: 28px;
         }
 
         .suggestion-word {
@@ -918,57 +952,48 @@ export default function Home() {
           font-weight: 700;
           letter-spacing: 0.15em;
           color: #e5e7eb;
+          min-width: 80px;
         }
 
-        .suggestion-stat {
+        .suggestion-stats {
+          display: flex;
+          gap: 1rem;
+          flex: 1;
+        }
+
+        .stat-elim {
           font-size: 0.85rem;
           color: #9ca3af;
         }
 
-        .suggestion-badge {
-          margin-left: auto;
-          font-size: 0.75rem;
+        .stat-answer {
+          font-size: 0.85rem;
           color: #22c55e;
-          background: rgba(34, 197, 94, 0.15);
-          padding: 0.25rem 0.5rem;
-          border-radius: 4px;
         }
 
-        /* Common Letters */
-        .common-letters-section {
-          margin-bottom: 1.5rem;
-        }
-
-        .common-letters {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 0.5rem;
-        }
-
-        .common-letter-item {
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          padding: 0.5rem 0.75rem;
-          background: #111827;
-          border-radius: 8px;
-          border: 1px solid rgba(245, 158, 11, 0.3);
-        }
-
-        .common-letter {
-          font-family: 'Space Mono', monospace;
-          font-size: 1.25rem;
-          font-weight: 700;
+        .stat-probe {
+          font-size: 0.85rem;
           color: #f59e0b;
+          font-style: italic;
         }
 
-        .common-letter-pct {
+        .badge {
           font-size: 0.7rem;
-          color: #6b7280;
+          padding: 0.2rem 0.5rem;
+          border-radius: 4px;
+          font-weight: 600;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
         }
 
-        .info-words-section {
-          margin-top: 1rem;
+        .badge-answer {
+          background: rgba(34, 197, 94, 0.2);
+          color: #22c55e;
+        }
+
+        .badge-probe {
+          background: rgba(245, 158, 11, 0.2);
+          color: #f59e0b;
         }
 
         /* Frequencies Section */
@@ -1001,17 +1026,24 @@ export default function Home() {
             gap: 0.5rem;
           }
           
-          .suggestion-badge {
-            margin-left: 0;
-            margin-top: 0.5rem;
+          .suggestion-stats {
             width: 100%;
-            text-align: center;
+            order: 3;
+          }
+          
+          .badge {
+            order: 4;
           }
         }
 
         @media (max-width: 480px) {
           .freq-grid {
             grid-template-columns: 1fr;
+          }
+          
+          h1 {
+            font-size: 1.75rem;
+            letter-spacing: 0.15em;
           }
         }
 
