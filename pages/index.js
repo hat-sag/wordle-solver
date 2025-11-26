@@ -343,7 +343,7 @@ export default function Home() {
   
   // Filter extended word list (fallback)
   const filteredExtended = useMemo(() => {
-    if (filteredWords.length > 0 || extendedWords.length === 0) return [];
+    if (filteredWords.length > 0 || !extendedWords || extendedWords.length === 0) return [];
     return filterWordList(extendedWords, guesses);
   }, [guesses, filteredWords.length]);
 
@@ -357,11 +357,16 @@ export default function Home() {
   // Detect pattern trap
   const patternInfo = useMemo(() => detectPatternTrap(displayWords), [displayWords]);
 
-  // Calculate smart suggestions (blended algorithm)
+  // Calculate smart suggestions - ALWAYS calculate for preview
   const { suggestions: smartSuggestions, patternBreakers } = useMemo(() => {
-    if (!showSuggestions) return { suggestions: [], patternBreakers: [] };
+    if (guesses.length === 0 || displayWords.length <= 1 || displayWords.length > 300) {
+      return { suggestions: [], patternBreakers: [] };
+    }
     return calculateSmartSuggestions(displayWords, wordleWords, guesses.length, knownLetters, patternInfo);
-  }, [displayWords, showSuggestions, guesses.length, knownLetters, patternInfo]);
+  }, [displayWords, guesses.length, knownLetters, patternInfo]);
+
+  // Get top suggestion for preview
+  const topSuggestion = smartSuggestions.length > 0 ? smartSuggestions[0] : null;
 
   // Calculate letter frequencies by position
   const positionFrequencies = useMemo(() => {
@@ -424,6 +429,12 @@ export default function Home() {
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
     setShowSuggestions(false);
+  };
+
+  const startWithSalet = () => {
+    setCurrentWord('salet');
+    setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
+    setError('');
   };
 
   const removeGuess = (index) => {
@@ -531,6 +542,11 @@ export default function Home() {
                 Reset All
               </button>
             )}
+            {guesses.length === 0 && currentWord === '' && (
+              <button className="btn btn-ghost" onClick={startWithSalet}>
+                Start with SALET
+              </button>
+            )}
           </div>
         </div>
 
@@ -573,7 +589,12 @@ export default function Home() {
             >
               <span className="toggle-icon">{showSuggestions ? '▼' : '▶'}</span>
               <span>🧠 Smart Suggestions</span>
-              <span className="toggle-hint">{showSuggestions ? 'hide' : 'show optimal plays'}</span>
+              <span className="toggle-hint">
+                {topSuggestion && !showSuggestions && (
+                  <span className="top-pick">try <strong>{topSuggestion.word.toUpperCase()}</strong> · </span>
+                )}
+                {showSuggestions ? 'hide' : 'show all'}
+              </span>
             </button>
             
             {showSuggestions && (
@@ -887,6 +908,7 @@ export default function Home() {
         .button-row {
           display: flex;
           gap: 1rem;
+          flex-wrap: wrap;
         }
 
         .btn {
@@ -922,6 +944,19 @@ export default function Home() {
 
         .btn-secondary:hover {
           background: #4b5563;
+        }
+
+        .btn-ghost {
+          background: transparent;
+          color: #6b7280;
+          border: 1px dashed #4b5563;
+          font-size: 0.9rem;
+          padding: 0.6rem 1rem;
+        }
+
+        .btn-ghost:hover {
+          color: #9ca3af;
+          border-color: #6b7280;
         }
 
         .results-section {
@@ -1036,6 +1071,15 @@ export default function Home() {
           font-size: 0.85rem;
           font-weight: 400;
           color: #6b7280;
+        }
+
+        .top-pick {
+          color: #a5b4fc;
+        }
+
+        .top-pick strong {
+          color: #c4b5fd;
+          font-weight: 700;
         }
 
         .suggestions-content {
