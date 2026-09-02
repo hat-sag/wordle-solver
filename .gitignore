@@ -1,0 +1,10 @@
+node_modules/
+.next/
+out/
+
+# Local secrets — the Anthropic key for the AI word lookup lives here
+.env.local
+.env*.local
+
+.DS_Store
+*.log

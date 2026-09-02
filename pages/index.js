@@ -1,385 +1,67 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef, useCallback } from 'react';
 import Head from 'next/head';
 import { wordleWords, extendedWords } from '../data/words';
+import {
+  GRAY,
+  YELLOW,
+  GREEN,
+  filterWordList,
+  detectPatternTrap,
+  getRecommendations
+} from '../lib/solver';
 
-// Color states
-const GRAY = 'gray';
-const YELLOW = 'yellow';
-const GREEN = 'green';
-
-// Helper: Given a guess and an answer, return the color pattern
-function getColorPattern(guess, answer) {
-  const pattern = ['gray', 'gray', 'gray', 'gray', 'gray'];
-  const answerLetters = answer.split('');
-  const guessLetters = guess.split('');
-  
-  for (let i = 0; i < 5; i++) {
-    if (guessLetters[i] === answerLetters[i]) {
-      pattern[i] = 'green';
-      answerLetters[i] = null;
-      guessLetters[i] = null;
-    }
-  }
-  
-  for (let i = 0; i < 5; i++) {
-    if (guessLetters[i] !== null) {
-      const idx = answerLetters.indexOf(guessLetters[i]);
-      if (idx !== -1) {
-        pattern[i] = 'yellow';
-        answerLetters[idx] = null;
-      }
-    }
-  }
-  
-  return pattern.join(',');
-}
-
-// Normalize a value between 0 and 1
-function normalize(value, min, max) {
-  if (max === min) return 0.5;
-  return (value - min) / (max - min);
-}
-
-// Get letter frequency weights from remaining words
-function getLetterWeights(remainingWords) {
-  const counts = {};
-  for (const word of remainingWords) {
-    const uniqueLetters = new Set(word.split(''));
-    for (const letter of uniqueLetters) {
-      counts[letter] = (counts[letter] || 0) + 1;
-    }
-  }
-  return counts;
-}
-
-// Extract all letters that have been tested from guesses
-function getKnownLetters(guesses) {
-  const known = new Set();
-  for (const guess of guesses) {
-    for (const letter of guess.word) {
-      known.add(letter);
-    }
-  }
-  return known;
-}
-
-// DETECT PATTERN TRAP
-function detectPatternTrap(remainingWords) {
-  if (remainingWords.length < 2 || remainingWords.length > 20) {
-    return { isTrapped: false };
-  }
-
-  const n = remainingWords.length;
-  const lockedPositions = [];
-  const variablePositions = [];
-  const variableLettersByPosition = {};
-  let patternString = '';
-
-  for (let pos = 0; pos < 5; pos++) {
-    const lettersAtPos = {};
-    for (const word of remainingWords) {
-      const letter = word[pos];
-      lettersAtPos[letter] = (lettersAtPos[letter] || 0) + 1;
-    }
-
-    const uniqueLetters = Object.keys(lettersAtPos);
-    const mostCommonCount = Math.max(...Object.values(lettersAtPos));
-
-    if (mostCommonCount / n >= 0.8 && uniqueLetters.length <= 2) {
-      const dominantLetter = Object.entries(lettersAtPos).find(([_, count]) => count === mostCommonCount)[0];
-      lockedPositions.push(pos);
-      patternString += dominantLetter.toUpperCase();
-    } else {
-      variablePositions.push(pos);
-      variableLettersByPosition[pos] = uniqueLetters;
-      patternString += '_';
-    }
-  }
-
-  const isTrapped = lockedPositions.length >= 3 && variablePositions.length >= 1 && variablePositions.length <= 2;
-
-  const variableLetters = new Set();
-  for (const pos of variablePositions) {
-    for (const letter of variableLettersByPosition[pos]) {
-      variableLetters.add(letter);
-    }
-  }
-
-  return {
-    isTrapped,
-    pattern: patternString,
-    lockedPositions,
-    variablePositions,
-    variableLetters: [...variableLetters],
-    variableLettersByPosition
-  };
-}
-
-// Find probe words that test variable letters
-function findPatternBreakerWords(remainingWords, allWords, patternInfo, knownLetters) {
-  const { variableLetters } = patternInfo;
-  
-  if (variableLetters.length === 0) return [];
-
-  const probeScores = [];
-
-  for (const word of allWords) {
-    if (remainingWords.includes(word)) continue;
-
-    const uniqueLetters = new Set(word.split(''));
-    const testedVariableLetters = variableLetters.filter(vl => uniqueLetters.has(vl));
-
-    const minToTest = Math.min(2, variableLetters.length);
-    if (testedVariableLetters.length >= minToTest) {
-      const narrowsTo = Math.ceil(remainingWords.length / (testedVariableLetters.length + 1));
-
-      probeScores.push({
-        word,
-        testedLetters: testedVariableLetters.map(l => l.toUpperCase()),
-        testedCount: testedVariableLetters.length,
-        narrowsTo,
-        couldBeAnswer: false
-      });
-    }
-  }
-
-  probeScores.sort((a, b) => {
-    if (b.testedCount !== a.testedCount) return b.testedCount - a.testedCount;
-    return a.word.localeCompare(b.word);
-  });
-
-  return probeScores.slice(0, 5);
-}
-
-// THE BLENDED SMART SUGGESTIONS ALGORITHM
-function calculateSmartSuggestions(remainingWords, allWords, guessCount, knownLetters, patternInfo) {
-  const n = remainingWords.length;
-  if (n <= 1) return { suggestions: [], patternBreakers: [] };
-  if (n > 300) return { suggestions: [], patternBreakers: [] };
-
-  const turn = guessCount + 1;
-
-  let wElim = 1.0;
-  let wAnswer = 0.3;
-  let wCoverage = 0.4;
-  let dupPenalty = 0.25;
-
-  if (turn >= 3 && turn <= 4) {
-    wElim = 0.8;
-    wAnswer = 0.7;
-    wCoverage = 0.3;
-    dupPenalty = 0.15;
-  } else if (turn >= 5) {
-    wElim = 0.4;
-    wAnswer = 1.0;
-    wCoverage = 0.15;
-    dupPenalty = 0.05;
-  }
-
-  const letterWeights = getLetterWeights(remainingWords);
-
-  let candidates;
-  if (n > 40) {
-    const scored = allWords.map(word => {
-      const uniqueLetters = new Set(word.split(''));
-      let coverageScore = 0;
-      for (const letter of uniqueLetters) {
-        if (!knownLetters.has(letter)) {
-          coverageScore += letterWeights[letter] || 0;
-        }
-      }
-      return { 
-        word, 
-        coverageScore, 
-        inRemaining: remainingWords.includes(word) 
-      };
-    });
-
-    scored.sort((a, b) => {
-      if (b.coverageScore !== a.coverageScore) return b.coverageScore - a.coverageScore;
-      if (a.inRemaining !== b.inRemaining) return (b.inRemaining ? 1 : 0) - (a.inRemaining ? 1 : 0);
-      return 0;
-    });
-
-    candidates = scored.slice(0, 120).map(s => s.word);
-    
-    for (const word of remainingWords) {
-      if (!candidates.includes(word)) {
-        candidates.push(word);
-      }
-    }
-  } else {
-    candidates = [...remainingWords];
-  }
-
-  const guessScoresRaw = [];
-
-  for (const guess of candidates) {
-    const patternBuckets = {};
-
-    for (const answer of remainingWords) {
-      const pattern = getColorPattern(guess, answer);
-      patternBuckets[pattern] = (patternBuckets[pattern] || 0) + 1;
-    }
-
-    const bucketSizes = Object.values(patternBuckets);
-    const expectedRemaining = bucketSizes.reduce((sum, size) => sum + (size * size), 0) / n;
-    const elimFraction = (n - expectedRemaining) / n;
-
-    const inRemaining = remainingWords.includes(guess);
-    const answerProb = inRemaining ? 1 / n : 0;
-
-    const uniqueLetters = [...new Set(guess.split(''))];
-    let coverageScore = 0;
-    for (const letter of uniqueLetters) {
-      if (!knownLetters.has(letter)) {
-        coverageScore += letterWeights[letter] || 0;
-      }
-    }
-
-    const hasDuplicate = uniqueLetters.length < 5;
-    const dupPenaltyApplied = hasDuplicate ? dupPenalty : 0;
-
-    guessScoresRaw.push({
-      word: guess,
-      expectedRemaining,
-      elimFraction,
-      answerProb,
-      coverageScore,
-      inRemaining,
-      hasDuplicate,
-      dupPenaltyApplied
-    });
-  }
-
-  const minCov = Math.min(...guessScoresRaw.map(g => g.coverageScore));
-  const maxCov = Math.max(...guessScoresRaw.map(g => g.coverageScore));
-
-  const guessScores = guessScoresRaw.map(g => {
-    const elimComponent = g.elimFraction;
-    const coverageComponent = normalize(g.coverageScore, minCov, maxCov);
-    const answerComponent = g.answerProb * n;
-
-    const blendedScore =
-      wElim * elimComponent +
-      wCoverage * coverageComponent +
-      wAnswer * answerComponent -
-      g.dupPenaltyApplied;
-
-    return {
-      word: g.word,
-      blendedScore,
-      expectedRemaining: g.expectedRemaining,
-      eliminationPct: Math.round(g.elimFraction * 100),
-      answerProbPct: Math.round(g.answerProb * 100),
-      coverageScore: g.coverageScore,
-      couldBeAnswer: g.inRemaining,
-      hasDuplicate: g.hasDuplicate
-    };
-  });
-
-  guessScores.sort((a, b) => b.blendedScore - a.blendedScore);
-
-  let patternBreakers = [];
-  if (patternInfo.isTrapped) {
-    patternBreakers = findPatternBreakerWords(remainingWords, allWords, patternInfo, knownLetters);
-  }
-
-  return {
-    suggestions: guessScores.slice(0, 10),
-    patternBreakers
-  };
-}
-
-// Filter function that works on any word list
-function filterWordList(words, guesses) {
-  let filtered = [...words];
-  
-  for (const guess of guesses) {
-    const { word, colors } = guess;
-    
-    filtered = filtered.filter(candidate => {
-      for (let i = 0; i < 5; i++) {
-        const letter = word[i];
-        const color = colors[i];
-        
-        if (color === GREEN) {
-          if (candidate[i] !== letter) return false;
-        } else if (color === YELLOW) {
-          if (candidate[i] === letter) return false;
-          if (!candidate.includes(letter)) return false;
-        } else if (color === GRAY) {
-          const letterPositions = [];
-          for (let j = 0; j < 5; j++) {
-            if (word[j] === letter) letterPositions.push(j);
-          }
-          const hasGreenOrYellow = letterPositions.some(
-            pos => colors[pos] === GREEN || colors[pos] === YELLOW
-          );
-          
-          if (hasGreenOrYellow) {
-            if (candidate[i] === letter) return false;
-          } else {
-            if (candidate.includes(letter)) return false;
-          }
-        }
-      }
-      return true;
-    });
-  }
-  
-  return filtered;
-}
+// Above this many candidates the recommendation math stops being interesting —
+// almost anything eliminates a lot, so we just show letter frequencies instead.
+const MAX_CANDIDATES_FOR_ADVICE = 300;
 
 export default function Home() {
   const [guesses, setGuesses] = useState([]);
   const [currentWord, setCurrentWord] = useState('');
   const [currentColors, setCurrentColors] = useState([GRAY, GRAY, GRAY, GRAY, GRAY]);
   const [error, setError] = useState('');
-  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [showAllSuggestions, setShowAllSuggestions] = useState(false);
 
-  // Filter primary word list
+  // AI fallback state, used only when the word bank has run dry.
+  const [aiWords, setAiWords] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState('');
+
+  const inputRef = useRef(null);
+
   const filteredWords = useMemo(() => filterWordList(wordleWords, guesses), [guesses]);
-  
-  // Filter extended word list (fallback)
+
   const filteredExtended = useMemo(() => {
     if (filteredWords.length > 0 || !extendedWords || extendedWords.length === 0) return [];
     return filterWordList(extendedWords, guesses);
   }, [guesses, filteredWords.length]);
 
-  // Use extended list if primary is empty
   const usingExtended = filteredWords.length === 0 && filteredExtended.length > 0;
   const displayWords = usingExtended ? filteredExtended : filteredWords;
 
-  // Get letters we've already tested
-  const knownLetters = useMemo(() => getKnownLetters(guesses), [guesses]);
-
-  // Detect pattern trap
   const patternInfo = useMemo(() => detectPatternTrap(displayWords), [displayWords]);
 
-  // Calculate smart suggestions - ALWAYS calculate for preview
-  const { suggestions: smartSuggestions, patternBreakers } = useMemo(() => {
-    if (guesses.length === 0 || displayWords.length <= 1 || displayWords.length > 300) {
-      return { suggestions: [], patternBreakers: [] };
+  const advice = useMemo(() => {
+    if (
+      guesses.length === 0 ||
+      displayWords.length <= 1 ||
+      displayWords.length > MAX_CANDIDATES_FOR_ADVICE
+    ) {
+      return null;
     }
-    return calculateSmartSuggestions(displayWords, wordleWords, guesses.length, knownLetters, patternInfo);
-  }, [displayWords, guesses.length, knownLetters, patternInfo]);
+    return getRecommendations(displayWords, wordleWords);
+  }, [displayWords, guesses.length]);
 
-  // Get top suggestion for preview
-  const topSuggestion = smartSuggestions.length > 0 ? smartSuggestions[0] : null;
-
-  // Calculate letter frequencies by position
   const positionFrequencies = useMemo(() => {
     const frequencies = [];
-    
+
     for (let pos = 0; pos < 5; pos++) {
       const letterCounts = {};
-      
+
       for (const word of displayWords) {
         const letter = word[pos];
         letterCounts[letter] = (letterCounts[letter] || 0) + 1;
       }
-      
+
       const total = displayWords.length;
       const sorted = Object.entries(letterCounts)
         .map(([letter, count]) => ({
@@ -389,20 +71,12 @@ export default function Home() {
         }))
         .sort((a, b) => b.count - a.count)
         .slice(0, 8);
-      
+
       frequencies.push(sorted);
     }
-    
+
     return frequencies;
   }, [displayWords]);
-
-  // Determine game phase for display
-  const gamePhase = useMemo(() => {
-    const turn = guesses.length + 1;
-    if (turn <= 2) return { name: 'Early Game', desc: 'Prioritizing information gathering', color: '#f59e0b' };
-    if (turn <= 4) return { name: 'Mid Game', desc: 'Balancing info and solving', color: '#8b5cf6' };
-    return { name: 'Late Game', desc: 'Prioritizing the win', color: '#22c55e' };
-  }, [guesses.length]);
 
   const handleWordChange = (e) => {
     const val = e.target.value.toLowerCase().replace(/[^a-z]/g, '').slice(0, 5);
@@ -418,27 +92,37 @@ export default function Home() {
     setCurrentColors(newColors);
   };
 
+  // Drop any recommended (or listed) word straight into the input, ready for
+  // colouring. Same idea as the SALET shortcut, just for every word on screen.
+  const useWord = useCallback((word) => {
+    setCurrentWord(word.toLowerCase());
+    setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
+    setError('');
+    if (inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, []);
+
   const addGuess = () => {
     if (currentWord.length !== 5) {
       setError('Enter a 5-letter word');
       return;
     }
-    
+
     setGuesses([...guesses, { word: currentWord, colors: currentColors }]);
     setCurrentWord('');
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
-    setShowSuggestions(false);
-  };
-
-  const startWithSalet = () => {
-    setCurrentWord('salet');
-    setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
-    setError('');
+    setShowAllSuggestions(false);
+    setAiWords(null);
+    setAiError('');
   };
 
   const removeGuess = (index) => {
     setGuesses(guesses.filter((_, i) => i !== index));
+    setAiWords(null);
+    setAiError('');
   };
 
   const reset = () => {
@@ -446,7 +130,29 @@ export default function Home() {
     setCurrentWord('');
     setCurrentColors([GRAY, GRAY, GRAY, GRAY, GRAY]);
     setError('');
-    setShowSuggestions(false);
+    setShowAllSuggestions(false);
+    setAiWords(null);
+    setAiError('');
+  };
+
+  const askAI = async () => {
+    setAiLoading(true);
+    setAiError('');
+    setAiWords(null);
+    try {
+      const res = await fetch('/api/suggest-words', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ guesses })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      setAiWords(data.words || []);
+    } catch (err) {
+      setAiError(err.message);
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   const getColorClass = (color) => {
@@ -454,6 +160,8 @@ export default function Home() {
     if (color === YELLOW) return 'tile-yellow';
     return 'tile-gray';
   };
+
+  const verdict = advice?.verdict;
 
   return (
     <>
@@ -463,7 +171,7 @@ export default function Home() {
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="true" />
         <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet" />
       </Head>
-      
+
       <div className="container">
         <header>
           <h1>WORDLE SOLVER</h1>
@@ -494,9 +202,10 @@ export default function Home() {
         {/* Current Input */}
         <div className="input-section">
           <h2>{guesses.length === 0 ? 'Enter Your First Guess' : 'Enter Next Guess'}</h2>
-          
+
           <div className="word-input-container">
             <input
+              ref={inputRef}
               type="text"
               value={currentWord}
               onChange={handleWordChange}
@@ -530,8 +239,8 @@ export default function Home() {
           {error && <p className="error">{error}</p>}
 
           <div className="button-row">
-            <button 
-              className="btn btn-primary" 
+            <button
+              className="btn btn-primary"
               onClick={addGuess}
               disabled={currentWord.length !== 5}
             >
@@ -543,12 +252,95 @@ export default function Home() {
               </button>
             )}
             {guesses.length === 0 && currentWord === '' && (
-              <button className="btn btn-ghost" onClick={startWithSalet}>
+              <button className="btn btn-ghost" onClick={() => useWord('salet')}>
                 Start with SALET
               </button>
             )}
           </div>
         </div>
+
+        {/* Recommendations: answer vs probe, side by side */}
+        {advice && advice.bestAnswer && advice.bestProbe && (
+          <div className="advice-section">
+            <div className="advice-head">
+              <h2>Recommended Next Guess</h2>
+              <span className="advice-sub">
+                {displayWords.length} candidates · up to {advice.maxBits.toFixed(1)} bits to gain
+              </span>
+            </div>
+
+            {/* Pattern trap explains *why* a probe is often right here */}
+            {patternInfo.isTrapped && (
+              <div className="trap-note">
+                <span className="trap-pattern">{patternInfo.pattern}</span>
+                <span className="trap-text">
+                  Pattern trap — only{' '}
+                  <strong>{patternInfo.variableLetters.map(l => l.toUpperCase()).join(', ')}</strong>{' '}
+                  are still in question. Guessing candidates one at a time tests one letter per turn.
+                </span>
+              </div>
+            )}
+
+            <div className="pick-grid">
+              <RecommendationCard
+                kind="answer"
+                label="Best Answer Guess"
+                blurb="Could win this turn"
+                pick={advice.bestAnswer}
+                recommended={verdict?.pick === 'answer'}
+                total={displayWords.length}
+                onUse={useWord}
+              />
+              <RecommendationCard
+                kind="probe"
+                label="Best Probe Guess"
+                blurb="Can't win — buys information"
+                pick={advice.bestProbe}
+                recommended={verdict?.pick === 'probe'}
+                total={displayWords.length}
+                onUse={useWord}
+              />
+            </div>
+
+            {verdict && (
+              <div className={`verdict verdict-${verdict.pick}`}>
+                <div className="verdict-top">
+                  <span className="verdict-badge">{verdict.headline}</span>
+                  <span className="verdict-math">
+                    {advice.bestAnswer.word.toUpperCase()} {advice.bestAnswer.expTurns.toFixed(2)} turns
+                    {'  vs  '}
+                    {advice.bestProbe.word.toUpperCase()} {advice.bestProbe.expTurns.toFixed(2)} turns
+                  </span>
+                </div>
+                <p className="verdict-detail">{verdict.detail}</p>
+              </div>
+            )}
+
+            <button
+              className="more-toggle"
+              onClick={() => setShowAllSuggestions(!showAllSuggestions)}
+            >
+              {showAllSuggestions ? '▼ hide runners-up' : '▶ show runners-up'}
+            </button>
+
+            {showAllSuggestions && (
+              <div className="runners-grid">
+                <RunnerUpList
+                  title="Other answer guesses"
+                  kind="answer"
+                  items={advice.answers.slice(1)}
+                  onUse={useWord}
+                />
+                <RunnerUpList
+                  title="Other probes"
+                  kind="probe"
+                  items={advice.probes.slice(1)}
+                  onUse={useWord}
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Results */}
         <div className="results-section">
@@ -557,7 +349,6 @@ export default function Home() {
             <span className="word-count">{displayWords.length} remaining</span>
           </div>
 
-          {/* Extended list notice */}
           {usingExtended && (
             <div className="extended-notice">
               ⚠️ No common words match — showing all valid Wordle words
@@ -566,13 +357,55 @@ export default function Home() {
 
           {displayWords.length === 0 ? (
             <div className="no-words">
-              <p>No words match your criteria. Check your inputs!</p>
-              <p className="no-words-hint">The word might be a newer NYT addition not in our list yet.</p>
+              <p>No words match your criteria.</p>
+              <p className="no-words-hint">
+                Either a color is marked wrong, or today&apos;s answer is a newer NYT word that
+                isn&apos;t in our bank yet.
+              </p>
+
+              <div className="ai-block">
+                <button className="btn btn-ai" onClick={askAI} disabled={aiLoading}>
+                  {aiLoading ? 'Thinking…' : '✨ Ask AI for the missing word'}
+                </button>
+                <p className="ai-hint">
+                  Sends just your guesses and colors to Claude, which knows words our bank
+                  doesn&apos;t.
+                </p>
+
+                {aiError && <p className="error">{aiError}</p>}
+
+                {aiWords && aiWords.length === 0 && (
+                  <p className="ai-empty">Claude couldn&apos;t find a word fitting all those clues either — worth double-checking your tile colors.</p>
+                )}
+
+                {aiWords && aiWords.length > 0 && (
+                  <div className="ai-results">
+                    {aiWords.map((item, idx) => (
+                      <button
+                        key={idx}
+                        className="ai-word"
+                        onClick={() => useWord(item.word)}
+                        title="Click to use this word"
+                      >
+                        <span className="ai-word-text">{item.word.toUpperCase()}</span>
+                        <span className="ai-word-reason">{item.reason}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           ) : displayWords.length <= 50 ? (
             <div className="word-grid">
               {displayWords.map((word, idx) => (
-                <div key={idx} className="word-item">{word}</div>
+                <button
+                  key={idx}
+                  className="word-item"
+                  onClick={() => useWord(word)}
+                  title="Click to use this word"
+                >
+                  {word}
+                </button>
               ))}
             </div>
           ) : (
@@ -580,106 +413,11 @@ export default function Home() {
           )}
         </div>
 
-        {/* Smart Suggestions */}
-        {guesses.length > 0 && displayWords.length > 1 && displayWords.length <= 300 && (
-          <div className="suggestions-section">
-            <button 
-              className="suggestions-toggle"
-              onClick={() => setShowSuggestions(!showSuggestions)}
-            >
-              <span className="toggle-icon">{showSuggestions ? '▼' : '▶'}</span>
-              <span>🧠 Smart Suggestions</span>
-              <span className="toggle-hint">
-                {topSuggestion && !showSuggestions && (
-                  <span className="top-pick">try <strong>{topSuggestion.word.toUpperCase()}</strong> · </span>
-                )}
-                {showSuggestions ? 'hide' : 'show all'}
-              </span>
-            </button>
-            
-            {showSuggestions && (
-              <div className="suggestions-content">
-                {/* Game Phase Indicator */}
-                <div className="phase-indicator" style={{ borderColor: gamePhase.color }}>
-                  <span className="phase-name" style={{ color: gamePhase.color }}>{gamePhase.name}</span>
-                  <span className="phase-desc">{gamePhase.desc}</span>
-                </div>
-
-                {/* Pattern Trap Alert */}
-                {patternInfo.isTrapped && (
-                  <div className="pattern-alert">
-                    <div className="pattern-header">
-                      <span className="pattern-icon">⚠️</span>
-                      <span className="pattern-title">Pattern trap detected</span>
-                    </div>
-                    <div className="pattern-details">
-                      <span className="pattern-string">{patternInfo.pattern}</span>
-                      <span className="pattern-varying">
-                        varying: {patternInfo.variableLetters.map(l => l.toUpperCase()).join(', ')}
-                      </span>
-                    </div>
-                    
-                    {patternBreakers.length > 0 && (
-                      <div className="pattern-breakers">
-                        <p className="breakers-label">Test multiple letters at once:</p>
-                        {patternBreakers.map((breaker, idx) => (
-                          <div key={idx} className="breaker-item">
-                            <span className="breaker-word">{breaker.word.toUpperCase()}</span>
-                            <span className="breaker-tests">
-                              tests {breaker.testedLetters.join(', ')}
-                            </span>
-                            <span className="breaker-narrows">
-                              → narrows to ~{breaker.narrowsTo}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Regular Suggestions */}
-                {smartSuggestions.length === 0 ? (
-                  <p className="calculating">Calculating...</p>
-                ) : (
-                  <div className="suggestions-list">
-                    {smartSuggestions.map((guess, idx) => (
-                      <div key={idx} className={`suggestion-item ${guess.couldBeAnswer ? 'is-answer' : 'is-probe'}`}>
-                        <span className="suggestion-rank">#{idx + 1}</span>
-                        <span className="suggestion-word">{guess.word.toUpperCase()}</span>
-                        <div className="suggestion-stats">
-                          <span className="stat-elim">eliminates ~{guess.eliminationPct}%</span>
-                          {guess.couldBeAnswer ? (
-                            <span className="stat-answer">
-                              {displayWords.length <= 10 
-                                ? `1 in ${displayWords.length} chance`
-                                : `${guess.answerProbPct > 0 ? guess.answerProbPct : '<1'}% to win`
-                              }
-                            </span>
-                          ) : (
-                            <span className="stat-probe">probe word</span>
-                          )}
-                        </div>
-                        {guess.couldBeAnswer && (
-                          <span className="badge badge-answer">✓ could be answer</span>
-                        )}
-                        {!guess.couldBeAnswer && (
-                          <span className="badge badge-probe">info only</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
         {/* Position Frequencies */}
         <div className="frequencies-section">
           <h2>Letter Probabilities by Position</h2>
           <p className="freq-hint">Use these to strategically pick your next guess</p>
-          
+
           <div className="freq-grid">
             {positionFrequencies.map((freqs, posIdx) => (
               <div key={posIdx} className="freq-column">
@@ -689,10 +427,7 @@ export default function Home() {
                     <div key={idx} className="freq-item">
                       <span className="freq-letter">{letter}</span>
                       <div className="freq-bar-container">
-                        <div 
-                          className="freq-bar" 
-                          style={{ width: `${percentage}%` }}
-                        ></div>
+                        <div className="freq-bar" style={{ width: `${percentage}%` }}></div>
                       </div>
                       <span className="freq-percent">{percentage}%</span>
                     </div>
@@ -714,13 +449,13 @@ export default function Home() {
           margin: 0;
           padding: 0;
         }
-        
+
         body {
           font-family: 'Outfit', sans-serif;
           background: #0a0a0f;
           color: #e8e6e3;
           min-height: 100vh;
-          background-image: 
+          background-image:
             radial-gradient(ellipse at 20% 0%, rgba(99, 102, 241, 0.15) 0%, transparent 50%),
             radial-gradient(ellipse at 80% 100%, rgba(34, 197, 94, 0.1) 0%, transparent 50%);
         }
@@ -959,6 +694,143 @@ export default function Home() {
           border-color: #6b7280;
         }
 
+        /* --- Recommendations --- */
+
+        .advice-section {
+          background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.08) 100%);
+          border: 1px solid rgba(99, 102, 241, 0.3);
+          border-radius: 16px;
+          padding: 1.5rem;
+          margin-bottom: 2rem;
+        }
+
+        .advice-head {
+          display: flex;
+          justify-content: space-between;
+          align-items: baseline;
+          gap: 1rem;
+          flex-wrap: wrap;
+          margin-bottom: 1rem;
+        }
+
+        .advice-head h2 {
+          margin-bottom: 0;
+          color: #c7d2fe;
+        }
+
+        .advice-sub {
+          font-family: 'Space Mono', monospace;
+          font-size: 0.75rem;
+          color: #6b7280;
+        }
+
+        .trap-note {
+          display: flex;
+          align-items: center;
+          gap: 0.9rem;
+          background: rgba(239, 68, 68, 0.1);
+          border: 1px solid rgba(239, 68, 68, 0.25);
+          border-radius: 10px;
+          padding: 0.75rem 1rem;
+          margin-bottom: 1rem;
+        }
+
+        .trap-pattern {
+          font-family: 'Space Mono', monospace;
+          font-size: 1.15rem;
+          font-weight: 700;
+          letter-spacing: 0.2em;
+          color: #f87171;
+          white-space: nowrap;
+        }
+
+        .trap-text {
+          font-size: 0.85rem;
+          color: #d1d5db;
+          line-height: 1.45;
+        }
+
+        .trap-text strong {
+          color: #fca5a5;
+        }
+
+        .pick-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 1rem;
+          margin-bottom: 1rem;
+        }
+
+        .verdict {
+          border-radius: 12px;
+          padding: 0.9rem 1.1rem;
+          border-left: 3px solid;
+          background: rgba(0, 0, 0, 0.35);
+        }
+
+        .verdict-answer {
+          border-color: #22c55e;
+        }
+
+        .verdict-probe {
+          border-color: #f59e0b;
+        }
+
+        .verdict-top {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 1rem;
+          flex-wrap: wrap;
+          margin-bottom: 0.4rem;
+        }
+
+        .verdict-badge {
+          font-family: 'Space Mono', monospace;
+          font-weight: 700;
+          font-size: 0.8rem;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          color: #e5e7eb;
+        }
+
+        .verdict-math {
+          font-family: 'Space Mono', monospace;
+          font-size: 0.72rem;
+          color: #6b7280;
+          white-space: pre;
+        }
+
+        .verdict-detail {
+          font-size: 0.87rem;
+          color: #9ca3af;
+          line-height: 1.5;
+        }
+
+        .more-toggle {
+          margin-top: 1rem;
+          background: transparent;
+          border: none;
+          color: #8b5cf6;
+          font-family: 'Outfit', sans-serif;
+          font-size: 0.85rem;
+          cursor: pointer;
+          padding: 0;
+        }
+
+        .more-toggle:hover {
+          color: #a78bfa;
+        }
+
+        .runners-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 1rem;
+          margin-top: 0.75rem;
+        }
+
+        /* --- Results --- */
+
         .results-section {
           background: rgba(31, 41, 55, 0.5);
           border: 1px solid #374151;
@@ -1010,8 +882,18 @@ export default function Home() {
           letter-spacing: 0.1em;
           padding: 0.5rem;
           background: #111827;
+          border: 1px solid #1f2937;
+          color: #e5e7eb;
           border-radius: 6px;
           text-align: center;
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+
+        .word-item:hover {
+          border-color: #6366f1;
+          color: #c7d2fe;
+          transform: translateY(-1px);
         }
 
         .no-words {
@@ -1028,265 +910,87 @@ export default function Home() {
           color: #6b7280;
         }
 
+        .ai-block {
+          margin-top: 1.25rem;
+          padding-top: 1.25rem;
+          border-top: 1px solid #374151;
+        }
+
+        .btn-ai {
+          background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+          color: white;
+        }
+
+        .btn-ai:hover:not(:disabled) {
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+        }
+
+        .btn-ai:disabled {
+          opacity: 0.6;
+          cursor: wait;
+        }
+
+        .ai-hint {
+          font-size: 0.8rem;
+          color: #6b7280;
+          margin-top: 0.6rem;
+        }
+
+        .ai-empty {
+          font-size: 0.85rem;
+          color: #9ca3af;
+          margin-top: 0.75rem;
+        }
+
+        .ai-results {
+          display: flex;
+          flex-direction: column;
+          gap: 0.5rem;
+          margin-top: 1rem;
+        }
+
+        .ai-word {
+          display: flex;
+          align-items: baseline;
+          gap: 0.9rem;
+          text-align: left;
+          width: 100%;
+          padding: 0.7rem 0.9rem;
+          background: #111827;
+          border: 1px solid rgba(99, 102, 241, 0.35);
+          border-radius: 8px;
+          cursor: pointer;
+          font-family: 'Outfit', sans-serif;
+          transition: all 0.15s;
+        }
+
+        .ai-word:hover {
+          border-color: #8b5cf6;
+          transform: translateY(-1px);
+        }
+
+        .ai-word-text {
+          font-family: 'Space Mono', monospace;
+          font-weight: 700;
+          font-size: 1rem;
+          letter-spacing: 0.15em;
+          color: #c4b5fd;
+          min-width: 80px;
+        }
+
+        .ai-word-reason {
+          font-size: 0.82rem;
+          color: #9ca3af;
+          line-height: 1.4;
+        }
+
         .too-many {
           color: #9ca3af;
           font-style: italic;
         }
 
-        .suggestions-section {
-          background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
-          border: 1px solid rgba(99, 102, 241, 0.3);
-          border-radius: 16px;
-          margin-bottom: 2rem;
-          overflow: hidden;
-        }
-
-        .suggestions-toggle {
-          width: 100%;
-          padding: 1rem 1.5rem;
-          display: flex;
-          align-items: center;
-          gap: 0.75rem;
-          background: transparent;
-          border: none;
-          color: #e5e7eb;
-          font-family: 'Outfit', sans-serif;
-          font-size: 1rem;
-          font-weight: 600;
-          cursor: pointer;
-          transition: background 0.15s;
-        }
-
-        .suggestions-toggle:hover {
-          background: rgba(99, 102, 241, 0.15);
-        }
-
-        .toggle-icon {
-          font-size: 0.75rem;
-          color: #8b5cf6;
-        }
-
-        .toggle-hint {
-          margin-left: auto;
-          font-size: 0.85rem;
-          font-weight: 400;
-          color: #6b7280;
-        }
-
-        .top-pick {
-          color: #a5b4fc;
-        }
-
-        .top-pick strong {
-          color: #c4b5fd;
-          font-weight: 700;
-        }
-
-        .suggestions-content {
-          padding: 0 1.5rem 1.5rem 1.5rem;
-        }
-
-        .phase-indicator {
-          display: flex;
-          align-items: center;
-          gap: 1rem;
-          padding: 0.75rem 1rem;
-          background: rgba(0, 0, 0, 0.3);
-          border-radius: 8px;
-          border-left: 3px solid;
-          margin-bottom: 1rem;
-        }
-
-        .phase-name {
-          font-family: 'Space Mono', monospace;
-          font-weight: 700;
-          font-size: 0.85rem;
-          text-transform: uppercase;
-          letter-spacing: 0.1em;
-        }
-
-        .phase-desc {
-          font-size: 0.85rem;
-          color: #9ca3af;
-        }
-
-        .pattern-alert {
-          background: rgba(239, 68, 68, 0.1);
-          border: 1px solid rgba(239, 68, 68, 0.3);
-          border-radius: 12px;
-          padding: 1rem;
-          margin-bottom: 1rem;
-        }
-
-        .pattern-header {
-          display: flex;
-          align-items: center;
-          gap: 0.5rem;
-          margin-bottom: 0.5rem;
-        }
-
-        .pattern-icon {
-          font-size: 1.1rem;
-        }
-
-        .pattern-title {
-          font-weight: 600;
-          color: #fca5a5;
-        }
-
-        .pattern-details {
-          display: flex;
-          align-items: center;
-          gap: 1rem;
-          margin-bottom: 1rem;
-        }
-
-        .pattern-string {
-          font-family: 'Space Mono', monospace;
-          font-size: 1.5rem;
-          font-weight: 700;
-          letter-spacing: 0.2em;
-          color: #ef4444;
-        }
-
-        .pattern-varying {
-          font-size: 0.85rem;
-          color: #9ca3af;
-        }
-
-        .pattern-breakers {
-          background: rgba(0, 0, 0, 0.2);
-          border-radius: 8px;
-          padding: 0.75rem;
-        }
-
-        .breakers-label {
-          font-size: 0.8rem;
-          color: #9ca3af;
-          margin-bottom: 0.5rem;
-        }
-
-        .breaker-item {
-          display: flex;
-          align-items: center;
-          gap: 0.75rem;
-          padding: 0.5rem 0;
-          border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-        }
-
-        .breaker-item:last-child {
-          border-bottom: none;
-        }
-
-        .breaker-word {
-          font-family: 'Space Mono', monospace;
-          font-weight: 700;
-          font-size: 1rem;
-          letter-spacing: 0.1em;
-          color: #fbbf24;
-          min-width: 70px;
-        }
-
-        .breaker-tests {
-          font-size: 0.85rem;
-          color: #d1d5db;
-        }
-
-        .breaker-narrows {
-          font-size: 0.8rem;
-          color: #22c55e;
-          margin-left: auto;
-        }
-
-        .calculating {
-          color: #6b7280;
-          font-style: italic;
-        }
-
-        .suggestions-list {
-          display: flex;
-          flex-direction: column;
-          gap: 0.5rem;
-        }
-
-        .suggestion-item {
-          display: flex;
-          align-items: center;
-          gap: 1rem;
-          padding: 0.75rem 1rem;
-          background: #111827;
-          border-radius: 8px;
-          border: 1px solid #1f2937;
-          flex-wrap: wrap;
-        }
-
-        .suggestion-item.is-answer {
-          border-color: rgba(34, 197, 94, 0.4);
-          background: linear-gradient(135deg, rgba(34, 197, 94, 0.08) 0%, rgba(17, 24, 39, 1) 100%);
-        }
-
-        .suggestion-item.is-probe {
-          border-color: rgba(245, 158, 11, 0.4);
-          background: linear-gradient(135deg, rgba(245, 158, 11, 0.08) 0%, rgba(17, 24, 39, 1) 100%);
-        }
-
-        .suggestion-rank {
-          font-family: 'Space Mono', monospace;
-          font-size: 0.85rem;
-          color: #8b5cf6;
-          font-weight: 700;
-          min-width: 28px;
-        }
-
-        .suggestion-word {
-          font-family: 'Space Mono', monospace;
-          font-size: 1.1rem;
-          font-weight: 700;
-          letter-spacing: 0.15em;
-          color: #e5e7eb;
-          min-width: 80px;
-        }
-
-        .suggestion-stats {
-          display: flex;
-          gap: 1rem;
-          flex: 1;
-        }
-
-        .stat-elim {
-          font-size: 0.85rem;
-          color: #9ca3af;
-        }
-
-        .stat-answer {
-          font-size: 0.85rem;
-          color: #22c55e;
-        }
-
-        .stat-probe {
-          font-size: 0.85rem;
-          color: #f59e0b;
-          font-style: italic;
-        }
-
-        .badge {
-          font-size: 0.7rem;
-          padding: 0.2rem 0.5rem;
-          border-radius: 4px;
-          font-weight: 600;
-          text-transform: uppercase;
-          letter-spacing: 0.05em;
-        }
-
-        .badge-answer {
-          background: rgba(34, 197, 94, 0.2);
-          color: #22c55e;
-        }
-
-        .badge-probe {
-          background: rgba(245, 158, 11, 0.2);
-          color: #f59e0b;
-        }
+        /* --- Frequencies --- */
 
         .frequencies-section {
           background: rgba(31, 41, 55, 0.5);
@@ -1306,52 +1010,6 @@ export default function Home() {
           display: grid;
           grid-template-columns: repeat(5, 1fr);
           gap: 1rem;
-        }
-
-        @media (max-width: 768px) {
-          .freq-grid {
-            grid-template-columns: repeat(2, 1fr);
-          }
-          
-          .suggestion-item {
-            gap: 0.5rem;
-          }
-          
-          .suggestion-stats {
-            width: 100%;
-            order: 3;
-          }
-          
-          .badge {
-            order: 4;
-          }
-
-          .pattern-details {
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 0.25rem;
-          }
-
-          .breaker-item {
-            flex-wrap: wrap;
-          }
-
-          .breaker-narrows {
-            width: 100%;
-            margin-left: 0;
-            margin-top: 0.25rem;
-          }
-        }
-
-        @media (max-width: 480px) {
-          .freq-grid {
-            grid-template-columns: 1fr;
-          }
-          
-          h1 {
-            font-size: 1.75rem;
-            letter-spacing: 0.15em;
-          }
         }
 
         .freq-column {
@@ -1418,7 +1076,293 @@ export default function Home() {
           color: #4b5563;
           font-size: 0.85rem;
         }
+
+        @media (max-width: 768px) {
+          .freq-grid {
+            grid-template-columns: repeat(2, 1fr);
+          }
+
+          .pick-grid,
+          .runners-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .trap-note {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.4rem;
+          }
+
+          .verdict-math {
+            white-space: normal;
+          }
+        }
+
+        @media (max-width: 480px) {
+          .freq-grid {
+            grid-template-columns: 1fr;
+          }
+
+          h1 {
+            font-size: 1.75rem;
+            letter-spacing: 0.15em;
+          }
+        }
       `}</style>
     </>
+  );
+}
+
+// One of the two headline picks. The whole card is the button — clicking it
+// loads the word into the input.
+function RecommendationCard({ kind, label, blurb, pick, recommended, total, onUse }) {
+  const winChance = kind === 'answer' ? 1 / total : 0;
+
+  return (
+    <button
+      className={`pick pick-${kind} ${recommended ? 'is-recommended' : ''}`}
+      onClick={() => onUse(pick.word)}
+      title="Click to load this word into the input"
+    >
+      <div className="pick-head">
+        <span className="pick-label">{label}</span>
+        {recommended && <span className="pick-flag">recommended</span>}
+      </div>
+
+      <div className="pick-word">{pick.word.toUpperCase()}</div>
+      <div className="pick-blurb">{blurb}</div>
+
+      <div className="pick-stats">
+        <div className="stat">
+          <span className="stat-value">{pick.bits.toFixed(2)}</span>
+          <span className="stat-key">bits gained</span>
+        </div>
+        <div className="stat">
+          <span className="stat-value">{pick.expTurns.toFixed(2)}</span>
+          <span className="stat-key">exp. turns</span>
+        </div>
+        <div className="stat">
+          <span className="stat-value">{pick.worst}</span>
+          <span className="stat-key">worst case left</span>
+        </div>
+        <div className="stat">
+          <span className="stat-value">
+            {kind === 'answer'
+              ? winChance >= 0.01
+                ? `${Math.round(winChance * 100)}%`
+                : '<1%'
+              : '—'}
+          </span>
+          <span className="stat-key">win now</span>
+        </div>
+      </div>
+
+      <span className="pick-cta">click to use →</span>
+
+      <style jsx>{`
+        .pick {
+          display: block;
+          width: 100%;
+          text-align: left;
+          padding: 1rem 1.1rem;
+          border-radius: 12px;
+          background: #111827;
+          border: 1px solid #1f2937;
+          cursor: pointer;
+          font-family: 'Outfit', sans-serif;
+          transition: all 0.15s;
+        }
+
+        .pick-answer {
+          border-color: rgba(34, 197, 94, 0.35);
+        }
+
+        .pick-probe {
+          border-color: rgba(245, 158, 11, 0.35);
+        }
+
+        .pick:hover {
+          transform: translateY(-2px);
+        }
+
+        .pick-answer:hover {
+          border-color: #22c55e;
+          box-shadow: 0 4px 14px rgba(34, 197, 94, 0.15);
+        }
+
+        .pick-probe:hover {
+          border-color: #f59e0b;
+          box-shadow: 0 4px 14px rgba(245, 158, 11, 0.15);
+        }
+
+        .pick-answer.is-recommended {
+          background: linear-gradient(135deg, rgba(34, 197, 94, 0.14) 0%, rgba(17, 24, 39, 1) 70%);
+          border-color: #22c55e;
+        }
+
+        .pick-probe.is-recommended {
+          background: linear-gradient(135deg, rgba(245, 158, 11, 0.14) 0%, rgba(17, 24, 39, 1) 70%);
+          border-color: #f59e0b;
+        }
+
+        .pick-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 0.5rem;
+          margin-bottom: 0.6rem;
+        }
+
+        .pick-label {
+          font-family: 'Space Mono', monospace;
+          font-size: 0.68rem;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          color: #9ca3af;
+        }
+
+        .pick-flag {
+          font-size: 0.6rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          padding: 0.18rem 0.45rem;
+          border-radius: 4px;
+          background: ${kind === 'answer' ? 'rgba(34, 197, 94, 0.22)' : 'rgba(245, 158, 11, 0.22)'};
+          color: ${kind === 'answer' ? '#22c55e' : '#f59e0b'};
+          white-space: nowrap;
+        }
+
+        .pick-word {
+          font-family: 'Space Mono', monospace;
+          font-size: 1.7rem;
+          font-weight: 700;
+          letter-spacing: 0.18em;
+          color: ${kind === 'answer' ? '#dcfce7' : '#fef3c7'};
+          line-height: 1.1;
+        }
+
+        .pick-blurb {
+          font-size: 0.78rem;
+          color: #6b7280;
+          margin-top: 0.15rem;
+          margin-bottom: 0.85rem;
+        }
+
+        .pick-stats {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 0.5rem 0.75rem;
+          padding-top: 0.75rem;
+          border-top: 1px solid #1f2937;
+        }
+
+        .stat {
+          display: flex;
+          flex-direction: column;
+        }
+
+        .stat-value {
+          font-family: 'Space Mono', monospace;
+          font-size: 0.95rem;
+          font-weight: 700;
+          color: #e5e7eb;
+        }
+
+        .stat-key {
+          font-size: 0.66rem;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          color: #6b7280;
+        }
+
+        .pick-cta {
+          display: block;
+          margin-top: 0.85rem;
+          font-size: 0.72rem;
+          color: ${kind === 'answer' ? '#22c55e' : '#f59e0b'};
+          opacity: 0.75;
+        }
+      `}</style>
+    </button>
+  );
+}
+
+function RunnerUpList({ title, kind, items, onUse }) {
+  return (
+    <div className="runners">
+      <h3>{title}</h3>
+      {items.length === 0 ? (
+        <p className="runners-empty">Nothing else close.</p>
+      ) : (
+        items.map((item, idx) => (
+          <button key={idx} className="runner" onClick={() => onUse(item.word)}>
+            <span className="runner-word">{item.word.toUpperCase()}</span>
+            <span className="runner-stats">
+              {item.bits.toFixed(2)} bits · {item.expTurns.toFixed(2)} turns · worst {item.worst}
+            </span>
+          </button>
+        ))
+      )}
+
+      <style jsx>{`
+        .runners {
+          background: rgba(0, 0, 0, 0.25);
+          border-radius: 10px;
+          padding: 0.85rem;
+        }
+
+        h3 {
+          font-family: 'Space Mono', monospace;
+          font-size: 0.68rem;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          color: #6b7280;
+          margin-bottom: 0.6rem;
+        }
+
+        .runners-empty {
+          font-size: 0.8rem;
+          color: #4b5563;
+          font-style: italic;
+        }
+
+        .runner {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 0.75rem;
+          width: 100%;
+          padding: 0.45rem 0.55rem;
+          margin-bottom: 0.25rem;
+          background: transparent;
+          border: 1px solid transparent;
+          border-radius: 6px;
+          cursor: pointer;
+          font-family: 'Outfit', sans-serif;
+          transition: all 0.12s;
+        }
+
+        .runner:hover {
+          background: #111827;
+          border-color: ${kind === 'answer' ? 'rgba(34, 197, 94, 0.4)' : 'rgba(245, 158, 11, 0.4)'};
+        }
+
+        .runner-word {
+          font-family: 'Space Mono', monospace;
+          font-weight: 700;
+          font-size: 0.88rem;
+          letter-spacing: 0.12em;
+          color: ${kind === 'answer' ? '#86efac' : '#fcd34d'};
+        }
+
+        .runner-stats {
+          font-family: 'Space Mono', monospace;
+          font-size: 0.66rem;
+          color: #6b7280;
+          text-align: right;
+        }
+      `}</style>
+    </div>
   );
 }
